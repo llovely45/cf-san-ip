@@ -108,7 +108,12 @@ jobs:
               *) echo "unsupported release architecture: $GOARCH" >&2; exit 1 ;;
             esac
           done
-          if [ "$GOARCH" = "$(go env GOARCH)" ]; then
+          case "$(uname -m)" in
+            x86_64|amd64) HOST_GOARCH=amd64 ;;
+            aarch64|arm64) HOST_GOARCH=arm64 ;;
+            *) HOST_GOARCH=unknown ;;
+          esac
+          if [ "$GOARCH" = "$HOST_GOARCH" ]; then
             "$work/out/zgrab2" tls --help >/dev/null 2>&1
           fi
           cp "$work/zgrab2-src/LICENSE" "$work/out/THIRD_PARTY_NOTICES.txt"
