@@ -10,7 +10,7 @@
   "d1_databases": [{
     "binding": "DB",
     "database_name": "cf-san-ip",
-    "database_id": "00000000-0000-0000-0000-000000000000",
+    "database_id": "363b7e01-67df-4f11-95d7-5ff85c1c9cff",
     "migrations_dir": "migrations"
   }]
 }
