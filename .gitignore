@@ -8,3 +8,4 @@ coverage/
 !.env.example
 pnpm-debug.log
 .DS_Store
+.superpowers/sdd/
