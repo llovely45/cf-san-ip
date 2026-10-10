@@ -113,11 +113,19 @@ export function parseGetIpQuery(
   let limit = 10;
 
   if (limitParam !== null) {
-    const parsedLimit = parsePositiveInteger(limitParam);
-    if (parsedLimit === null) {
+    if (!/^\d+$/u.test(limitParam)) {
       return invalid("limit must be a positive integer");
     }
-    limit = Math.min(parsedLimit, 20);
+
+    const significantDigits = limitParam.replace(/^0+/u, "");
+    if (significantDigits.length === 0) {
+      return invalid("limit must be a positive integer");
+    }
+
+    limit =
+      significantDigits.length > 2
+        ? 20
+        : Math.min(Number(significantDigits), 20);
   }
 
   return { ok: true, value: { asn, limit } };

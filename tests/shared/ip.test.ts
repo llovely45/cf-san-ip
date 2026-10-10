@@ -156,6 +156,17 @@ describe("parseGetIpQuery", () => {
     });
   });
 
+  it("clamps extremely large positive integer limits to 20", () => {
+    expect(
+      parseGetIpQuery(
+        new URLSearchParams({ limit: "9".repeat(300) }),
+      ),
+    ).toEqual({
+      ok: true,
+      value: { asn: null, limit: 20 },
+    });
+  });
+
   it.each(["", "0", "-1", "1.5", "abc", " 5"])(
     "rejects invalid limit %j",
     (limit) => {
