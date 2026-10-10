@@ -14,7 +14,6 @@ export default defineConfig({
   ],
   test: {
     exclude: [...configDefaults.exclude, "tests/client/**"],
-    passWithNoTests: true,
     setupFiles: ["./tests/worker/apply-migrations.ts"],
   },
 });

@@ -7,6 +7,5 @@ export default defineConfig({
       "tests/shared/**/*.{test,spec}.?(c|m)[jt]s?(x)",
       "tests/client/**/*.{test,spec}.?(c|m)[jt]s?(x)",
     ],
-    passWithNoTests: true,
   },
 });

@@ -8,4 +8,9 @@ type TestEnv = typeof env & {
 
 const testEnv = env as TestEnv;
 
-await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
+const migrations = testEnv.TEST_MIGRATIONS;
+if (migrations.length === 0) {
+  throw new Error("Worker tests require at least one D1 migration");
+}
+
+await applyD1Migrations(testEnv.DB, migrations);
