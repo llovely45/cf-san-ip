@@ -417,9 +417,9 @@ describe("agent installer panel", () => {
     render(<App api={api} />);
 
     expect(await screen.findByRole("heading", { name: "安装 cf-san Agent" })).toBeTruthy();
-    expect(screen.getByText(/curl -fsSL/)).toBeTruthy();
-    expect(screen.getByText(/shell 历史/)).toBeTruthy();
-    expect(screen.getByRole("button", { name: "复制安装命令" })).toBeTruthy();
+    expect(await screen.findByText(/curl -fsSL/)).toBeTruthy();
+    expect(await screen.findByText(/shell 历史/)).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "复制安装命令" })).toBeTruthy();
   });
 
   it("copies the install command when the clipboard is available", async () => {

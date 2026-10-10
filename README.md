@@ -14,7 +14,7 @@ ZGrab2 first requires a successful TLS handshake; it is then followed by the dir
 
 The authenticated UI's **安装 cf-san Agent** panel creates a command with `--url` and `--token`. It warns that the token may remain in shell history or be visible in local process arguments. The installer URL itself has no token query parameter, and the Worker does not log the token.
 
-Set the non-secret Worker environment variable `CF_SAN_RELEASE_REPOSITORY` to the actual public GitHub repository in `owner/repository` form before using the installer panel. `/install` returns a clear `503` if this variable is missing or malformed. Do not put the API token in this variable. The variable must match the repository where the `v*` release workflow publishes assets.
+The non-secret Worker variable `CF_SAN_RELEASE_REPOSITORY` is configured in `wrangler.jsonc` as `llovely45/cf-san-ip`. `/install` returns a clear `503` if this variable is missing or malformed. Do not put the API token in this variable. Keep it aligned with the repository where the `v*` release workflow publishes assets.
 
 The tag workflow runs the full Worker, UI, Go, migration, and installer checks. For a `v*` tag it creates:
 
