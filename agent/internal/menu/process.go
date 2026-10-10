@@ -93,7 +93,7 @@ func (m Manager) Start() error {
 		return errors.New("cannot start scanner process")
 	}
 	_ = logFile.Close()
-	metadata, err := json.Marshal(pidRecord{PID: command.Process.Pid, Executable: m.Executable})
+	metadata, err := json.Marshal(pidRecord{PID: command.Process.Pid, Executable: command.Path})
 	if err == nil {
 		err = os.WriteFile(m.pidPath(), append(metadata, '\n'), 0o600)
 	}
@@ -174,11 +174,15 @@ func processMatches(pid int, executable string) bool {
 	if !found || strings.HasPrefix(processState, "Z") {
 		return false
 	}
-	commandLine, err := os.ReadFile(filepath.Join(procDir, "cmdline"))
-	if err != nil {
+	runningExecutable, err := os.Readlink(filepath.Join(procDir, "exe"))
+	if err != nil || strings.HasSuffix(runningExecutable, " (deleted)") {
 		return false
 	}
-	return strings.Contains(string(commandLine), filepath.Base(executable))
+	expectedExecutable, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		expectedExecutable = executable
+	}
+	return filepath.Clean(runningExecutable) == filepath.Clean(expectedExecutable)
 }
 
 func (m Manager) String() string {

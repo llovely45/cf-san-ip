@@ -2,10 +2,26 @@ package menu
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestProcessMatchesUsesExecutableInsteadOfArgvZero(t *testing.T) {
+	command := exec.Command("/bin/sleep", "30")
+	command.Args[0] = "renamed-agent"
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	})
+	if !processMatches(command.Process.Pid, command.Path) {
+		t.Fatal("processMatches rejected a process whose argv[0] differs from its executable")
+	}
+}
 
 func TestManagerStartsStopsAndRejectsDuplicateRun(t *testing.T) {
 	dir := t.TempDir()
