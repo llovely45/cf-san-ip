@@ -2,6 +2,10 @@ import type { IpRecord } from "../../shared/ip";
 
 export interface IpRepository {
   upsert(record: IpRecord): Promise<void>;
+  updateByIp(
+    existingIp: string,
+    record: IpRecord,
+  ): Promise<"updated" | "not_found" | "conflict">;
   getByIp(ip: string): Promise<IpRecord | null>;
   findAliasByAsn(asn: number): Promise<string | null>;
   setAliasForAsn(asn: number, alias: string | null): Promise<number>;
@@ -53,6 +57,39 @@ export class D1IpRepository implements IpRepository {
       )
       .bind(record.ip, record.port, record.asn, record.region, record.asnAlias)
       .run();
+  }
+
+  async updateByIp(
+    existingIp: string,
+    record: IpRecord,
+  ): Promise<"updated" | "not_found" | "conflict"> {
+    const result = await this.db
+      .prepare(
+        `UPDATE ip_records
+         SET ip = ?, port = ?, asn = ?, region = ?, asn_alias = ?
+         WHERE ip = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM ip_records AS existing
+             WHERE existing.ip = ? AND existing.ip <> ?
+           )`,
+      )
+      .bind(
+        record.ip,
+        record.port,
+        record.asn,
+        record.region,
+        record.asnAlias,
+        existingIp,
+        record.ip,
+        existingIp,
+      )
+      .run();
+
+    if (result.meta.changes === 1) {
+      return "updated";
+    }
+
+    return (await this.getByIp(existingIp)) === null ? "not_found" : "conflict";
   }
 
   async getByIp(ip: string): Promise<IpRecord | null> {

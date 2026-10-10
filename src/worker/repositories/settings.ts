@@ -35,6 +35,23 @@ export class D1SettingsRepository {
     return toAppSettings(row);
   }
 
+  async getAdminPassword(): Promise<string | null> {
+    const row = await this.db
+      .prepare(
+        `SELECT admin_password
+         FROM app_settings
+         WHERE singleton_id = ?`,
+      )
+      .bind(SETTINGS_ROW_ID)
+      .first<{ admin_password: string | null }>();
+
+    if (row === null) {
+      throw new Error("app settings row is missing");
+    }
+
+    return row.admin_password;
+  }
+
   async initializeAdmin(password: string): Promise<boolean> {
     const result = await this.db
       .prepare(
