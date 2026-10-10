@@ -68,6 +68,11 @@ function parseAsn(value: string): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/gu, `'\\''`)}'`;
+}
+
 function resolveDb(env: Env, fallbackEnv?: Env): D1Database {
   const db = env?.DB ?? fallbackEnv?.DB;
   if (db === undefined) {
@@ -250,6 +255,30 @@ export function createAdminRoutes(fallbackEnv?: Env) {
       resolveDb(context.env, fallbackEnv),
     ).setApiToken(token);
     return context.json({ token });
+  });
+
+  routes.get("/agent/install-command", async (context) => {
+    const releaseRepository =
+      context.env?.CF_SAN_RELEASE_REPOSITORY ?? fallbackEnv?.CF_SAN_RELEASE_REPOSITORY;
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(releaseRepository ?? "")) {
+      return context.json({ error: "release_repository_not_configured" }, 503);
+    }
+
+    const apiToken = await new D1SettingsRepository(
+      resolveDb(context.env, fallbackEnv),
+    ).get();
+    if (apiToken.apiToken === null || apiToken.apiToken.length === 0) {
+      return context.json({ error: "api_token_not_configured" }, 503);
+    }
+
+    const origin = new URL(context.req.url).origin;
+    if (!origin.startsWith("https://")) {
+      return context.json({ error: "https_required" }, 400);
+    }
+    return context.json({
+      command: `curl -fsSL ${shellQuote(`${origin}/install`)} | sudo sh -s -- --url ${shellQuote(origin)} --token ${shellQuote(apiToken.apiToken)}`,
+      warning: "此命令包含 API Token，可能留在 shell 历史中，也可能被本机其他用户从进程参数看到。",
+    });
   });
 
   return routes;

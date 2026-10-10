@@ -349,3 +349,51 @@ describe("authenticated management APIs", () => {
     );
   });
 });
+
+describe("agent installer command", () => {
+  it("requires admin login and returns a shell-quoted command with a warning", async () => {
+    const configuredWorker = createApp({
+      DB: db,
+      JWT_SECRET: secret,
+      CF_SAN_RELEASE_REPOSITORY: "example/cf-san",
+    });
+    const adminCookie = `${cookieName}=${await createSession(secret)}`;
+    await new D1SettingsRepository(db).setApiToken("token ' with spaces");
+
+    const unauthorized = await configuredWorker.fetch(
+      new Request("https://app.test/api/admin/agent/install-command"),
+      { DB: db, JWT_SECRET: secret, CF_SAN_RELEASE_REPOSITORY: "example/cf-san" },
+    );
+    const response = await configuredWorker.fetch(
+      new Request("https://app.test/api/admin/agent/install-command", {
+        headers: { Cookie: adminCookie },
+      }),
+      { DB: db, JWT_SECRET: secret, CF_SAN_RELEASE_REPOSITORY: "example/cf-san" },
+    );
+
+    expect(unauthorized.status).toBe(401);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      command: "curl -fsSL 'https://app.test/install' | sudo sh -s -- --url 'https://app.test' --token 'token '\\'' with spaces'",
+      warning: expect.stringContaining("历史"),
+    });
+  });
+
+  it("returns a clear error if the API token is not set", async () => {
+    const configuredWorker = createApp({
+      DB: db,
+      JWT_SECRET: secret,
+      CF_SAN_RELEASE_REPOSITORY: "example/cf-san",
+    });
+    const adminCookie = `${cookieName}=${await createSession(secret)}`;
+    await new D1SettingsRepository(db).setApiToken(null);
+    const response = await configuredWorker.fetch(
+      new Request("https://app.test/api/admin/agent/install-command", {
+        headers: { Cookie: adminCookie },
+      }),
+      { DB: db, JWT_SECRET: secret, CF_SAN_RELEASE_REPOSITORY: "example/cf-san" },
+    );
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "api_token_not_configured" });
+  });
+});

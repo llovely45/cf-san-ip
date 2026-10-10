@@ -9,3 +9,6 @@ coverage/
 pnpm-debug.log
 .DS_Store
 .superpowers/sdd/
+agent/cf-san
+agent/cf-san_linux_*.tar.gz
+agent/cf-san_linux_*.tar.gz.sha256

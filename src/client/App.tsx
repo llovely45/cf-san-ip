@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import type { IpRecord } from "../shared/ip";
 import AliasEditor from "./components/AliasEditor";
+import AgentInstall from "./components/AgentInstall";
 import IpEditor from "./components/IpEditor";
 import IpTable from "./components/IpTable";
 import LoginForm from "./components/LoginForm";
@@ -339,6 +340,7 @@ export default function App({ api = clientApi }: AppProps) {
                 onSetToken={handleSetToken}
                 onGenerateToken={handleGenerateToken}
               />
+              <AgentInstall api={api} token={token} />
             </aside>
           </div>
         </>

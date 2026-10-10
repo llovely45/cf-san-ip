@@ -509,3 +509,28 @@ tbody tr:last-child td {
     align-items: flex-start;
   }
 }
+
+.install-command {
+  max-width: 100%;
+  margin: 12px 0;
+  overflow-x: auto;
+  padding: 13px;
+  border: 1px solid #dce8df;
+  border-radius: 9px;
+  background: #f6faf7;
+  color: #173d32;
+  font: 0.72rem/1.6 "DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.install-warning {
+  margin: 13px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #ead9ae;
+  border-radius: 9px;
+  background: #fffaf0;
+  color: #71551b;
+  font-size: 0.78rem;
+  line-height: 1.55;
+}

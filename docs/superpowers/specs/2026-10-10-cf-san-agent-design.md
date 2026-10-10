@@ -1,6 +1,6 @@
 # cf-san ASN Scanner Agent Design
 
-**Status:** Draft for user review  
+**Status:** Approved by the user on 2026-10-11
 **Date:** 2026-10-10  
 **Repository branch:** `codex/ip-pool-worker`
 

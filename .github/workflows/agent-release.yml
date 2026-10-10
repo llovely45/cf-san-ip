@@ -1,0 +1,133 @@
+name: Build and release cf-san Agent
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm exec wrangler d1 migrations apply cf-san-ip --local
+      - run: go test ./...
+        working-directory: agent
+      - run: go vet ./...
+        working-directory: agent
+      - run: sh scripts/install_test.sh
+        working-directory: agent
+
+  installer-integration:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:bookworm-slim, alpine:3.23]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - name: Prepare local release fixtures
+        working-directory: agent
+        run: |
+          set -eu
+          fixture="$RUNNER_TEMP/cf-san-installer-fixture"
+          mkdir -p "$fixture"
+          GOOS=linux GOARCH=amd64 go build -trimpath -o "$fixture/cf-san" ./cmd/cf-san
+          printf '#!/bin/sh\nexit 0\n' > "$fixture/zgrab2"
+          chmod 0755 "$fixture/zgrab2"
+          printf 'test fixture license notice\n' > "$fixture/THIRD_PARTY_NOTICES.txt"
+      - name: Exercise installer in ${{ matrix.image }}
+        env:
+          CONTAINER_IMAGE: ${{ matrix.image }}
+          FIXTURE_DIR: ${{ runner.temp }}/cf-san-installer-fixture
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/agent/scripts:/repo/scripts:ro" \
+            -v "$FIXTURE_DIR:/fixtures:ro" \
+            -e CF_SAN_FIXTURE_DIR=/fixtures \
+            "$CONTAINER_IMAGE" /bin/sh /repo/scripts/install_mocked_test.sh
+
+  build:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+      - name: Build scanner and ZGrab2 bundle
+        working-directory: agent
+        env:
+          CGO_ENABLED: 0
+          GOARCH: ${{ matrix.arch }}
+          GOOS: linux
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          mkdir -p "$work/out"
+          go build -trimpath -ldflags='-s -w' -o "$work/out/cf-san" ./cmd/cf-san
+          git clone --depth 1 --branch v1.0.0 https://github.com/zmap/zgrab2.git "$work/zgrab2-src"
+          (cd "$work/zgrab2-src/cmd/zgrab2" && go build -trimpath -ldflags='-s -w' -o "$work/out/zgrab2" .)
+          test -x "$work/out/zgrab2"
+          "$work/out/zgrab2" tls --help >/dev/null 2>&1
+          cp "$work/zgrab2-src/LICENSE" "$work/out/THIRD_PARTY_NOTICES.txt"
+          archive="cf-san_linux_${GOARCH}.tar.gz"
+          tar -C "$work/out" -czf "$archive" cf-san zgrab2 THIRD_PARTY_NOTICES.txt
+          sha256sum "$archive" > "$archive.sha256"
+          mkdir -p release-assets
+          mv "$archive" "$archive.sha256" release-assets/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cf-san-linux-${{ matrix.arch }}
+          path: agent/release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cf-san-linux-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release create "$TAG_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "cf-san ${TAG_NAME}" \
+            --generate-notes

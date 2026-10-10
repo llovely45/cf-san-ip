@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-10",
   "assets": {
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*", "/postip", "/getip"]
+    "run_worker_first": ["/api/*", "/postip", "/getip", "/install"]
   },
   "d1_databases": [{
     "binding": "DB",

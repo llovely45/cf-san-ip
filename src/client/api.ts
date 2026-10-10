@@ -17,6 +17,7 @@ export interface ClientApi {
   getToken(): Promise<{ token: string | null }>;
   setToken(token: string): Promise<void>;
   generateToken(): Promise<{ token: string }>;
+  getAgentInstallCommand(): Promise<{ command: string; warning: string }>;
 }
 
 type WireIpRecord = Omit<IpRecord, "asnAlias"> & { asn_alias: string | null };
@@ -140,6 +141,8 @@ export function createClientApi(fetchImplementation: typeof fetch = fetch): Clie
     },
     generateToken: () =>
       request("/api/admin/token/generate", { method: "POST" }),
+    getAgentInstallCommand: () =>
+      request("/api/admin/agent/install-command"),
   };
 }
 

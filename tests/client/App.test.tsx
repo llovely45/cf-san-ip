@@ -33,6 +33,10 @@ function createFakeApi(overrides: Partial<ClientApi> = {}): ClientApi {
     getToken: vi.fn().mockResolvedValue({ token: null }),
     setToken: vi.fn().mockResolvedValue(undefined),
     generateToken: vi.fn().mockResolvedValue({ token: "generated-token" }),
+    getAgentInstallCommand: vi.fn().mockResolvedValue({
+      command: "curl -fsSL 'https://app.test/install' | sudo bash -s -- --url 'https://app.test' --token 'existing-token'",
+      warning: "此命令中的 Token 会留在 shell 历史，且可能从进程参数中看到。",
+    }),
     ...overrides,
   };
 }
@@ -315,6 +319,10 @@ describe("ASN alias and token settings", () => {
     });
     const api = createAuthenticatedApi({
       generateToken: vi.fn().mockResolvedValue({ token: "generated-token" }),
+    getAgentInstallCommand: vi.fn().mockResolvedValue({
+      command: "curl -fsSL 'https://app.test/install' | sudo bash -s -- --url 'https://app.test' --token 'existing-token'",
+      warning: "此命令中的 Token 会留在 shell 历史，且可能从进程参数中看到。",
+    }),
     });
 
     try {
@@ -400,5 +408,52 @@ describe("same-origin API client", () => {
         }),
       }),
     );
+  });
+});
+
+describe("agent installer panel", () => {
+  it("shows a copyable one-command install line and the token visibility warning", async () => {
+    const api = createAuthenticatedApi();
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "安装 cf-san Agent" })).toBeTruthy();
+    expect(screen.getByText(/curl -fsSL/)).toBeTruthy();
+    expect(screen.getByText(/shell 历史/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "复制安装命令" })).toBeTruthy();
+  });
+
+  it("copies the install command when the clipboard is available", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const api = createAuthenticatedApi();
+
+    try {
+      render(<App api={api} />);
+      await user.click(await screen.findByRole("button", { name: "复制安装命令" }));
+      expect(writeText).toHaveBeenCalledWith(expect.stringContaining("--token 'existing-token'"));
+      expect(await screen.findByText("安装命令已复制。")).toBeTruthy();
+    } finally {
+      if (clipboardDescriptor === undefined) {
+        delete (navigator as Navigator & { clipboard?: Clipboard }).clipboard;
+      } else {
+        Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      }
+    }
+  });
+
+  it("explains when the Worker release repository has not been configured", async () => {
+    const api = createAuthenticatedApi({
+      getAgentInstallCommand: vi.fn().mockRejectedValue(
+        new Error("release_repository_not_configured"),
+      ),
+    });
+    render(<App api={api} />);
+    expect(await screen.findByText(/CF_SAN_RELEASE_REPOSITORY=owner\/repository/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "复制安装命令" })).toBeNull();
   });
 });

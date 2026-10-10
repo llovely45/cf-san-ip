@@ -1,86 +1,73 @@
-# cf-san-ip
+# cf-san IP Pool
 
-Cloudflare Worker、D1 和 React 管理界面组成的 IP 池管理服务。Worker 同源提供管理 API、管理 SPA，以及使用 Bearer Token 保护的 `POST /postip` 和 `GET /getip`。
+Cloudflare Workers + D1 IP pool with an authenticated admin UI, `/postip` and `/getip` APIs, and the `cf-san` ASN scanner agent.
 
-## 本地开发
+## Agent scan scope and behavior
 
-需要已安装 Node.js 和 pnpm。安装依赖并创建本地 Worker Secret 文件：
+Only run `cf-san` against an ASN and IPv4 prefixes that you own or are explicitly authorized to assess. The agent asks RIPEstat for currently originating IPv4 prefixes, rejects non-public/mixed special-purpose ranges, splits eligible ranges into numerically ordered `/24` scan blocks (or keeps narrower blocks intact), and probes TCP/443. ZMap permutes addresses within one block; the durable checkpoint is per block, so a pause can repeat the active block but completed blocks are skipped on the next run. Each invocation completes one current prefix plan and then stops; start it again later to refresh RIPEstat.
+
+`--limit` is the ZMap initial TCP probe rate in packets per second (default `100`), not a total interface shaper for subsequent TLS/HTTPS traffic. ZGrab2 concurrency is configured separately (`--senders`, default `100`). Set a conservative rate, follow the target network's acceptable-use policy, and pause promptly if asked. The agent never sends the API token to scan targets. HTTPS trace probes disable certificate verification only for the selected public IP; agent-to-Worker and agent-to-RIPEstat connections use ordinary TLS verification.
+
+ZGrab2 first requires a successful TLS handshake; it is then followed by the direct `/cdn-cgi/trace` request. A trace response is accepted only when its HTTP headers contain `Server: cloudflare` (case-insensitive), its body does not contain `error code: 1034`, and it contains one usable, non-empty, whitespace-free `loc=` value. HTTP status is not itself a rejection. Missing `loc=` means the result is not saved. Valid candidates are immediately reported to D1; other probes only update block-level progress. A progress heartbeat is sent every ten minutes and when a block completes, with the latest known open-port/TLS target IP when available. This version does not apply a separate JA3/JARM or certificate-fingerprint allowlist; Cloudflare identity is decided by the agreed HTTPS response check. A heartbeat does not claim an exact last attempted IP because ZMap's in-block permutation and non-responsive hosts do not expose a reliable ordered cursor.
+
+## Worker configuration for Agent installation
+
+The authenticated UI's **安装 cf-san Agent** panel creates a command with `--url` and `--token`. It warns that the token may remain in shell history or be visible in local process arguments. The installer URL itself has no token query parameter, and the Worker does not log the token.
+
+Set the non-secret Worker environment variable `CF_SAN_RELEASE_REPOSITORY` to the actual public GitHub repository in `owner/repository` form before using the installer panel. `/install` returns a clear `503` if this variable is missing or malformed. Do not put the API token in this variable. The variable must match the repository where the `v*` release workflow publishes assets.
+
+The tag workflow runs the full Worker, UI, Go, migration, and installer checks. For a `v*` tag it creates:
+
+- `cf-san_linux_amd64.tar.gz` and its `.sha256` file
+- `cf-san_linux_arm64.tar.gz` and its `.sha256` file
+
+Each archive contains the Go agent, the pinned ZGrab2 v1.0.0 binary, and its third-party license notice. ZMap is installed from the Debian/Alpine package manager on the target host. The installer checks the archive SHA-256 before installing either binary.
+
+## Linux installation and menu
+
+The generated command is intended for a Debian or Alpine Linux host with outbound HTTPS access and root/sudo privileges. It requires `curl` and a POSIX `sh` to fetch and run the script; the script installs `zmap`, CA certificates, and archive utilities, then installs `cf-san` and bundled `zgrab2` under `/usr/local/bin`.
+
+Run `sudo cf-san` to open the text menu. It supports:
+
+1. Initialize/check ZMap, ZGrab2, backend authentication, ASN, and the current scan plan.
+2. Start a one-pass scan in the background.
+3. Pause the scan with SIGTERM; the active block remains incomplete.
+4. Set ZMap rate in packets per second.
+5. Set ZGrab2 sender concurrency.
+6. Set ASN.
+7. View backend, ASN, rate, concurrency, and process status (the API token is not displayed).
+8. Exit.
+
+Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san`. The first version does not install a boot-time service.
+
+CLI settings override saved values, for example:
 
 ```sh
-pnpm install
-cp .dev.vars.example .dev.vars
+sudo cf-san configure --url 'https://worker.example' --token 'YOUR_API_TOKEN' --asn 906 --limit 100 --senders 100
+sudo cf-san run --config /etc/cf-san/config.json
 ```
 
-将 `.dev.vars` 中的示例值替换为仅供本机开发使用的随机 `JWT_SECRET`，不要复用生产密钥，也不要提交 `.dev.vars`。本地 D1 migration 和开发服务器：
+`run` executes one current plan in the foreground. The menu starts it in the background and provides the pause control.
+
+## Agent API
+
+Both endpoints require `Authorization: Bearer <API_TOKEN>`:
+
+- `GET /api/agent/v1/plan?asn=906` fetches and synchronizes the live authorized ASN plan.
+- `POST /api/agent/v1/report` sends a block heartbeat/completion, optionally with one validated candidate. Candidate persistence and checkpoint update are batched together in D1.
+
+These endpoints do not change existing `POST /postip` or `GET /getip` behavior. D1 stores scan history keyed by ASN and block; withdrawn prefixes disappear from the current plan but historical checkpoint rows remain.
+
+## Development verification
 
 ```sh
-pnpm exec wrangler d1 migrations apply cf-san-ip --local
-pnpm dev
-```
-
-打开 `http://127.0.0.1:5173`，首次访问时设置管理员密码，然后登录。在后台的 Token 设置区域设置或生成 API Token；此 Token 用于公开接口。Cookie 带有 `Secure` 标志，管理界面应通过本地开发地址在浏览器中使用；需要用 curl 验证 cookie 会话时，应使用本地 HTTPS 代理和临时证书，不要移除或放宽 `Secure`。
-
-公开接口示例（将占位 Token 替换为后台当前配置的值）：
-
-```sh
-curl -i \
-  -H 'Authorization: Bearer local-only-token' \
-  -H 'Content-Type: application/json' \
-  --data '{"ips":[{"ip":"192.0.2.10","port":443,"asn":906,"region":"US"}]}' \
-  http://127.0.0.1:5173/postip
-
-curl -i \
-  -H 'Authorization: Bearer local-only-token' \
-  'http://127.0.0.1:5173/getip?asn=906&limit=10'
-```
-
-`/getip` 返回 `text/plain`，每行一个 IP。`limit` 默认是 10，正整数大于 20 时按 20 处理。
-
-## 测试与构建
-
-Worker 和共享代码测试使用 Cloudflare Vitest 插件及本地 D1 migration；客户端测试使用 jsdom。两个测试项目可以独立运行，也可通过总入口依次运行：
-
-```sh
+pnpm install --frozen-lockfile
 pnpm test
-pnpm test:worker
-pnpm test:client
 pnpm typecheck
 pnpm build
-```
-
-本地 migration 可重复应用；开发和验收请使用 `--local`，不会创建或访问 Cloudflare 远端资源：
-
-```sh
 pnpm exec wrangler d1 migrations apply cf-san-ip --local
+(cd agent && go test ./... && go vet ./...)
+sh agent/scripts/install_test.sh
 ```
 
-## 生产部署
-
-以下步骤是部署说明，执行前请确认当前 Wrangler 登录账号和目标 Cloudflare 账户。生产 D1 与本地 D1 相互独立：
-
-1. 创建生产 D1，并将命令返回的真实 `database_id` 写入 `wrangler.jsonc` 中 `d1_databases[0].database_id`，替换现有的全零占位 ID：
-
-   ```sh
-   pnpm exec wrangler d1 create cf-san-ip
-   ```
-
-2. 将生产 JWT 签名密钥配置为 Worker Secret。使用密码管理器生成并保存高熵随机值；按 Wrangler 提示粘贴，不要把密钥写入源码或提交到 Git：
-
-   ```sh
-   pnpm exec wrangler secret put JWT_SECRET
-   ```
-
-3. 将 migration 应用到已确认的生产 D1，再构建并部署 Worker：
-
-   ```sh
-   pnpm exec wrangler d1 migrations apply cf-san-ip --remote
-   pnpm deploy
-   ```
-
-首次部署后，通过 HTTPS 打开站点设置管理员密码，登录后设置或生成 API Token。不要将本地 `.dev.vars` 中的值用作生产凭据。
-
-## 凭据存储与安全边界
-
-按当前数据模型，管理员密码和 API Token **以明文保存在 D1**；有权限读取生产 D1、其备份或导出数据的人员也能读取这两项凭据。应严格限制 D1、备份和 Cloudflare 账号访问权限，并在怀疑泄露时立即更换管理员密码及 API Token。API Token 可在管理界面查看，因此任何获得管理会话的人都能读取它。
-
-`JWT_SECRET` 不存入 D1：生产环境必须通过 Worker Secret 配置；仅本地开发使用被 Git 忽略的 `.dev.vars`。管理会话 Cookie 保持 `HttpOnly`、`Secure` 和 `SameSite=Lax`，生产站点必须通过 HTTPS 提供服务。
+This project does not scan an ASN, deploy the Worker, or mutate a remote D1 during local development. Follow the normal Cloudflare account/deployment process only after reviewing the code and configuring `JWT_SECRET`, D1, and `CF_SAN_RELEASE_REPOSITORY` in the target Worker environment.
