@@ -54,7 +54,7 @@ jobs:
           set -eu
           fixture="$RUNNER_TEMP/cf-san-installer-fixture"
           mkdir -p "$fixture"
-          GOOS=linux GOARCH=amd64 go build -trimpath -o "$fixture/cf-san" ./cmd/cf-san
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$fixture/cf-san" ./cmd/cf-san
           printf '#!/bin/sh\nexit 0\n' > "$fixture/zgrab2"
           chmod 0755 "$fixture/zgrab2"
           printf 'test fixture license notice\n' > "$fixture/THIRD_PARTY_NOTICES.txt"
@@ -97,7 +97,20 @@ jobs:
           git clone --depth 1 --branch v1.0.0 https://github.com/zmap/zgrab2.git "$work/zgrab2-src"
           (cd "$work/zgrab2-src/cmd/zgrab2" && go build -trimpath -ldflags='-s -w' -o "$work/out/zgrab2" .)
           test -x "$work/out/zgrab2"
-          "$work/out/zgrab2" tls --help >/dev/null 2>&1
+          # Cross-compiled binaries cannot run on the amd64 GitHub runner.
+          # Inspect the ELF architecture for every build, and only execute the
+          # native binary as a smoke test.
+          for binary in "$work/out/cf-san" "$work/out/zgrab2"; do
+            file "$binary"
+            case "$GOARCH" in
+              amd64) file "$binary" | grep -q 'x86-64' ;;
+              arm64) file "$binary" | grep -Eq 'ARM aarch64|ARM64' ;;
+              *) echo "unsupported release architecture: $GOARCH" >&2; exit 1 ;;
+            esac
+          done
+          if [ "$GOARCH" = "$(go env GOARCH)" ]; then
+            "$work/out/zgrab2" tls --help >/dev/null 2>&1
+          fi
           cp "$work/zgrab2-src/LICENSE" "$work/out/THIRD_PARTY_NOTICES.txt"
           archive="cf-san_linux_${GOARCH}.tar.gz"
           tar -C "$work/out" -czf "$archive" cf-san zgrab2 THIRD_PARTY_NOTICES.txt
