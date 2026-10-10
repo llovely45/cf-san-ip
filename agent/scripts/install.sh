@@ -2,8 +2,9 @@
 set -eu
 
 DEFAULT_RELEASE_REPOSITORY='__CF_SAN_RELEASE_REPOSITORY__'
-BACKEND_URL=''
-API_TOKEN=''
+BACKEND_URL=${CF_SAN_BACKEND_URL:-}
+API_TOKEN=${CF_SAN_API_TOKEN:-}
+UPDATE_ONLY=0
 
 fail() {
   printf 'cf-san installer: %s\n' "$1" >&2
@@ -11,7 +12,7 @@ fail() {
 }
 
 usage() {
-  printf 'Usage: install.sh --url https://worker.example --token TOKEN\n' >&2
+  printf 'Usage: install.sh --url https://worker.example --token TOKEN [--update-only]\n' >&2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -25,6 +26,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { usage; fail 'missing value for --token'; }
       API_TOKEN=$2
       shift 2
+      ;;
+    --update-only)
+      UPDATE_ONLY=1
+      shift
       ;;
     --help|-h)
       usage
@@ -46,25 +51,30 @@ printf '%s\n' "$RELEASE_REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+
   fail 'release repository is not configured on the Worker'
 
 [ "$(id -u)" -eq 0 ] || fail 'run this script with sudo or as root'
-[ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
-# shellcheck disable=SC1091
-. /etc/os-release
-case "${ID:-}" in
-  debian)
-    command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip zmap
-    ;;
-  alpine)
-    command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-    apk add --no-cache ca-certificates curl coreutils tar gzip zmap
-    ;;
-  *)
-    fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
-    ;;
-esac
-
-command -v zmap >/dev/null 2>&1 || fail 'ZMap installation failed; install the zmap package and retry'
+if [ "$UPDATE_ONLY" -eq 0 ]; then
+  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}" in
+    debian)
+      command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip zmap
+      ;;
+    alpine)
+      command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
+      apk add --no-cache ca-certificates curl coreutils tar gzip zmap
+      ;;
+    *)
+      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      ;;
+  esac
+  command -v zmap >/dev/null 2>&1 || fail 'ZMap installation failed; install the zmap package and retry'
+else
+  for command_name in curl tar gzip sha256sum install awk mktemp; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "required update command not found: $command_name"
+  done
+fi
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -94,4 +104,8 @@ if [ -f "${TEMP_DIR}/THIRD_PARTY_NOTICES.txt" ]; then
 fi
 
 /usr/local/bin/cf-san configure --url "$BACKEND_URL" --token "$API_TOKEN"
-printf 'cf-san installed. Run `cf-san` to initialize settings and open the text menu.\n'
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+  printf 'cf-san and bundled zgrab2 updated. Exit and restart `cf-san` to use the new version.\n'
+else
+  printf 'cf-san installed. Run `cf-san` to initialize settings and open the text menu.\n'
+fi

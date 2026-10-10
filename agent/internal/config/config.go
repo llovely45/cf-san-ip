@@ -34,10 +34,17 @@ func Defaults() Config {
 	return Config{Limit: 100, Senders: 100, AgentID: newAgentID()}
 }
 
-func Validate(cfg Config) error {
-	parsed, err := url.Parse(strings.TrimSpace(cfg.URL))
+func ValidateBackendURL(value string) error {
+	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("backend URL must be an HTTPS URL without credentials, query, or fragment")
+	}
+	return nil
+}
+
+func Validate(cfg Config) error {
+	if err := ValidateBackendURL(cfg.URL); err != nil {
+		return err
 	}
 	if strings.TrimSpace(cfg.Token) == "" {
 		return errors.New("API token is required")

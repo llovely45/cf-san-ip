@@ -18,10 +18,11 @@ import (
 )
 
 type App struct {
-	ConfigPath string
-	Manager    *Manager
-	Input      io.Reader
-	Output     io.Writer
+	ConfigPath  string
+	Manager     *Manager
+	Input       io.Reader
+	Output      io.Writer
+	updateAgent func(context.Context, config.Config, io.Writer) error
 }
 
 func NewApp() *App {
@@ -71,7 +72,10 @@ func (app *App) Run() error {
 		fmt.Fprintln(app.Output, "5. 设置 ZGrab2 并发数")
 		fmt.Fprintln(app.Output, "6. 设置 ASN")
 		fmt.Fprintln(app.Output, "7. 查看配置与状态")
-		fmt.Fprintln(app.Output, "8. 退出")
+		fmt.Fprintln(app.Output, "8. 修改后端地址")
+		fmt.Fprintln(app.Output, "9. 修改 API Token")
+		fmt.Fprintln(app.Output, "10. 更新 cf-san 和 ZGrab2 到最新版本")
+		fmt.Fprintln(app.Output, "11. 退出")
 		choice, err := readLine(reader, app.Output, "请选择：")
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -96,16 +100,22 @@ func (app *App) Run() error {
 			} else {
 				fmt.Fprintln(app.Output, "已发送安全暂停信号；当前块会在下次运行时重扫。")
 			}
-		case "4", "5", "6":
+		case "4", "5", "6", "8", "9":
 			if err := app.updateSetting(reader, &cfg, choice); err != nil {
 				fmt.Fprintf(app.Output, "设置失败：%v\n", err)
 			}
 		case "7":
 			app.printStatus(cfg)
-		case "8":
+		case "10":
+			if err := app.updateLatest(&cfg); err != nil {
+				fmt.Fprintf(app.Output, "更新失败：%v\n", err)
+			} else {
+				fmt.Fprintln(app.Output, "更新完成；请退出菜单后重新运行 cf-san，以加载新版本。")
+			}
+		case "11":
 			return nil
 		default:
-			fmt.Fprintln(app.Output, "无效选项，请输入 1–8。")
+			fmt.Fprintln(app.Output, "无效选项，请输入 1–11。")
 		}
 	}
 }
@@ -175,6 +185,27 @@ func (app *App) start(cfg *config.Config) error {
 	return app.manager().Start()
 }
 
+func (app *App) updateLatest(cfg *config.Config) error {
+	running, err := app.manager().Status()
+	if err != nil {
+		return err
+	}
+	if running {
+		return errors.New("请先暂停扫描，再执行更新")
+	}
+	if err := config.Validate(*cfg); err != nil {
+		return err
+	}
+	if err := config.Save(app.ConfigPath, *cfg); err != nil {
+		return err
+	}
+	updater := app.updateAgent
+	if updater == nil {
+		updater = updateLatestFromWorker
+	}
+	return updater(context.Background(), *cfg, app.Output)
+}
+
 func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice string) error {
 	key, prompt := "", ""
 	switch choice {
@@ -184,6 +215,10 @@ func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice s
 		key, prompt = "senders", "新的 ZGrab2 并发数："
 	case "6":
 		key, prompt = "asn", "新的 ASN："
+	case "8":
+		key, prompt = "url", "新的 Worker HTTPS 地址："
+	case "9":
+		key, prompt = "token", "新的 API Token（明文保存）："
 	}
 	value, err := readLine(reader, app.Output, prompt)
 	if err != nil {
@@ -208,7 +243,7 @@ func (app *App) printStatus(cfg config.Config) {
 	}
 	tokenState := "未配置"
 	if cfg.Token != "" {
-		tokenState = "已配置（不在菜单中显示）"
+		tokenState = cfg.Token
 	}
 	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nZMap PPS 上限：%d\nZGrab2 并发：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
 		cfg.URL, cfg.ASN, cfg.Limit, cfg.Senders, tokenState, cfg.AgentID, state)
@@ -235,6 +270,16 @@ func UpdateSetting(cfg *config.Config, key, raw string) error {
 			return errors.New("ZGrab2 并发数必须是正整数")
 		}
 		cfg.Senders = uint32(parsed)
+	case "url":
+		if err := config.ValidateBackendURL(value); err != nil {
+			return err
+		}
+		cfg.URL = strings.TrimRight(value, "/")
+	case "token":
+		if value == "" {
+			return errors.New("API Token 不能为空")
+		}
+		cfg.Token = value
 	default:
 		return errors.New("未知配置项")
 	}

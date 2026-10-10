@@ -35,8 +35,11 @@ Run `sudo cf-san` to open the text menu. It supports:
 4. Set ZMap rate in packets per second.
 5. Set ZGrab2 sender concurrency.
 6. Set ASN.
-7. View backend, ASN, rate, concurrency, and process status (the API token is not displayed).
-8. Exit.
+7. View the backend address, plaintext API token, ASN, rate, concurrency, Agent ID, and process status.
+8. Change the backend HTTPS address.
+9. Change the API token.
+10. After pausing any active scan, fetch the current installer script from the configured Worker and use it to install the latest GitHub Release of `cf-san` and bundled ZGrab2. This mode skips OS package installation and preserves the saved scan settings.
+11. Exit. After updating, exit and run `sudo cf-san` again to load the new binary.
 
 Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san`. The first version does not install a boot-time service.
 

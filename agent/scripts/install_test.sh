@@ -14,6 +14,7 @@ bash -n "$INSTALLER" || fail 'installer has invalid Bash-compatible syntax'
 
 HELP_OUTPUT=$(sh "$INSTALLER" --help 2>&1) || fail '--help did not succeed'
 printf '%s' "$HELP_OUTPUT" | grep -q 'Usage:' || fail '--help omitted usage'
+printf '%s' "$HELP_OUTPUT" | grep -q -- '--update-only' || fail '--help omitted update-only mode'
 
 expect_failure() {
   expected=$1

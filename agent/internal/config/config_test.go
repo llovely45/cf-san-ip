@@ -63,3 +63,22 @@ func TestOverridesReplaceOnlyExplicitValues(t *testing.T) {
 		t.Fatalf("MergeOverrides() = %#v, want %#v", got, want)
 	}
 }
+
+func TestValidateBackendURL(t *testing.T) {
+	for _, tc := range []struct {
+		url string
+		ok  bool
+	}{
+		{"https://worker.example", true},
+		{"https://worker.example/base", true},
+		{"http://worker.example", false},
+		{"https://user:pass@worker.example", false},
+		{"https://worker.example?token=secret", false},
+		{"https://worker.example/#fragment", false},
+	} {
+		err := ValidateBackendURL(tc.url)
+		if (err == nil) != tc.ok {
+			t.Errorf("ValidateBackendURL(%q) error = %v, want success=%v", tc.url, err, tc.ok)
+		}
+	}
+}

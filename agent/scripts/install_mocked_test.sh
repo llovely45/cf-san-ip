@@ -94,6 +94,22 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
     alpine) grep -q '^apk add --no-cache .*zmap' "$PACKAGE_LOG" ;;
     *) echo "unexpected container OS: ${ID:-unset}" >&2; exit 1 ;;
   esac
+
+  /usr/local/bin/cf-san configure --url 'https://worker.example' --token 'old-token' --asn 16509 --limit 250 --senders 40
+  : > "$PACKAGE_LOG"
+  update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
+    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+      printf '%s\n' "$update_output" >&2
+      exit 1
+    }
+  case "$update_output" in *updated-token*) echo 'update installer echoed the API token' >&2; exit 1 ;; esac
+  [ ! -s "$PACKAGE_LOG" ] || { echo 'update-only unexpectedly invoked a package manager' >&2; cat "$PACKAGE_LOG" >&2; exit 1; }
+  grep -q '"url": "https://updated.example"' /etc/cf-san/config.json || { echo 'update did not save the new backend URL' >&2; exit 1; }
+  grep -q '"token": "updated-token"' /etc/cf-san/config.json || { echo 'update did not save the new API token' >&2; exit 1; }
+  grep -q '"asn": 16509' /etc/cf-san/config.json || { echo 'update did not preserve ASN' >&2; exit 1; }
+  grep -q '"limit": 250' /etc/cf-san/config.json || { echo 'update did not preserve ZMap rate' >&2; exit 1; }
+  grep -q '"senders": 40' /etc/cf-san/config.json || { echo 'update did not preserve ZGrab2 concurrency' >&2; exit 1; }
+
   rm -f /usr/local/bin/cf-san /usr/local/bin/zgrab2 /etc/cf-san/config.json
   rm -rf /etc/cf-san
   printf 'installer %s/%s install passed\n' "${ID:-linux}" "$release_arch"
