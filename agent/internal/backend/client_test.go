@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"cf-san/internal/prefix"
 )
 
 func TestNewClientRequiresHTTPSAndToken(t *testing.T) {
@@ -35,7 +37,7 @@ func TestPlanUsesBearerAuthAndRejectsASNOrScopeMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blocks, err := client.Plan(context.Background(), 64512)
+	plan, err := client.Plan(context.Background(), 64512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,8 +47,73 @@ func TestPlanUsesBearerAuthAndRejectsASNOrScopeMismatch(t *testing.T) {
 	if gotAuthorization != "Bearer secret-agent-token" {
 		t.Fatalf("Authorization = %q", gotAuthorization)
 	}
-	if len(blocks) != 1 || blocks[0].ASN != 64512 {
-		t.Fatalf("Plan() = %#v", blocks)
+	if plan.PrefixCount() != 1 {
+		t.Fatalf("Plan() prefix count = %d, want 1", plan.PrefixCount())
+	}
+}
+
+func TestPlanExpandsCompactPrefixesAndAppliesCheckpoints(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"asn":64512,"prefixes":["8.8.8.0/23"],"checkpoints":[{"sourcePrefix":"8.8.8.0/23","blockCidr":"8.8.8.0/24","status":"completed","latestIp":"8.8.8.200"}]}`)
+	}))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := client.Plan(context.Background(), 64512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocks []prefix.Block
+	if err := plan.ForEachPending(func(block prefix.Block) error {
+		blocks = append(blocks, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 1 || blocks[0].BlockCIDR != "8.8.9.0/24" || blocks[0].Status != "active" {
+		t.Fatalf("Plan() pending blocks = %#v, want the block after the completed checkpoint", blocks)
+	}
+}
+
+func TestPlanAcceptsTensOfThousandsOfPrefixesAndCheckpoints(t *testing.T) {
+	prefixes := make([]string, 19_152)
+	checkpoints := make([]prefix.Checkpoint, len(prefixes))
+	for index := range prefixes {
+		cidr := fmt.Sprintf("11.%d.%d.0/24", index/256, index%256)
+		prefixes[index] = cidr
+		checkpoints[index] = prefix.Checkpoint{
+			SourcePrefix: cidr,
+			BlockCIDR:    cidr,
+			Status:       "completed",
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"asn":         64512,
+		"prefixes":    prefixes,
+		"checkpoints": checkpoints,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) >= maxResponseBytes {
+		t.Fatalf("synthetic compact plan is %d bytes; want under %d", len(body), maxResponseBytes)
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := client.Plan(context.Background(), 64512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.PrefixCount() != len(prefixes) {
+		t.Fatalf("Plan() prefix count = %d, want %d", plan.PrefixCount(), len(prefixes))
 	}
 }
 

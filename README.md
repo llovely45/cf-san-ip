@@ -4,7 +4,7 @@ Cloudflare Workers + D1 IP pool with an authenticated admin UI, `/postip` and `/
 
 ## Agent scan scope and behavior
 
-Only run `cf-san` against an ASN and IPv4 prefixes that you own or are explicitly authorized to assess. The agent asks RIPEstat for currently originating IPv4 prefixes, rejects non-public/mixed special-purpose ranges, splits eligible ranges into numerically ordered `/24` scan blocks (or keeps narrower blocks intact), and probes TCP/443. ZMap permutes addresses within one block; the durable checkpoint is per block, so a pause can repeat the active block but completed blocks are skipped on the next run. Each invocation completes one current prefix plan and then stops; start it again later to refresh RIPEstat.
+Only run `cf-san` against an ASN and IPv4 prefixes that you own or are explicitly authorized to assess. The agent asks RIPEstat for currently originating IPv4 prefixes, rejects non-public/mixed special-purpose ranges, splits eligible ranges into numerically ordered `/24` scan blocks (or keeps narrower blocks intact), and probes TCP/443. The Worker returns the full current prefix set and sparse checkpoints; the Go agent lazily generates the same ordered block plan instead of expanding hundreds of thousands of blocks in the Worker or D1. A pause can repeat the active block, while the last completed position is retained for resumption. If the announced prefix set changes, the cursor resets so newly added lower-address ranges cannot be skipped; the scan range is never capped to make planning faster. Each invocation completes one current prefix plan and then stops; start it again later to refresh RIPEstat.
 
 `--limit` is the ZMap initial TCP probe rate in packets per second (default `100`), not a total interface shaper for subsequent TLS/HTTPS traffic. ZGrab2 concurrency is configured separately (`--senders`, default `100`). Set a conservative rate, follow the target network's acceptable-use policy, and pause promptly if asked. The agent never sends the API token to scan targets. HTTPS trace probes disable certificate verification only for the selected public IP; agent-to-Worker and agent-to-RIPEstat connections use ordinary TLS verification.
 
@@ -56,10 +56,10 @@ sudo cf-san run --config /etc/cf-san/config.json
 
 Both endpoints require `Authorization: Bearer <API_TOKEN>`:
 
-- `GET /api/agent/v1/plan?asn=906` fetches and synchronizes the live authorized ASN plan.
+- `GET /api/agent/v1/plan?asn=906` fetches the live authorized ASN prefix set and returns that complete set with sparse checkpoints; it does not materialize every `/24` row.
 - `POST /api/agent/v1/report` sends a block heartbeat/completion, optionally with one validated candidate. Candidate persistence and checkpoint update are batched together in D1.
 
-These endpoints do not change existing `POST /postip` or `GET /getip` behavior. D1 stores scan history keyed by ASN and block; withdrawn prefixes disappear from the current plan but historical checkpoint rows remain.
+These endpoints do not change existing `POST /postip` or `GET /getip` behavior. D1 stores the current plan snapshot and only the latest reported block per source prefix; the agent resumes from the furthest checkpoint in ascending order, repeating it if active and skipping it if completed. A changed prefix set clears the compact cursor, while the legacy `scan_blocks` table and its existing history are left intact.
 
 ## Development verification
 

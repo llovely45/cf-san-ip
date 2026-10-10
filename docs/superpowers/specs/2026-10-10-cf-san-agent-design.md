@@ -40,7 +40,9 @@ Add an API-token-protected endpoint:
 
 - `GET /api/agent/v1/plan?asn=<number>`
 
-The Worker fetches the current RIPEstat originating IPv4 prefix set for the ASN, rejects invalid or non-public prefixes, sorts and splits them into `/24`-sized blocks, synchronizes those blocks into D1, then returns the ordered plan with each block's status. If the live prefix source cannot be reached or validated, fail closed and do not start a new scan using an unverified target set.
+The Worker fetches the current RIPEstat originating IPv4 prefix set for the ASN, rejects invalid or non-public prefixes, normalizes and sorts the complete prefix set, then returns it with sparse checkpoints. It must not materialize or persist one D1 row per `/24`: a large ASN may produce hundreds of thousands of scan blocks. The Go agent lazily merges the prefix ranges into the same numerically ordered `/24` blocks (keeping prefixes narrower than `/24` intact), preserving the existing target range and block ordering. If the live prefix source cannot be reached or validated, fail closed and do not start a new scan using an unverified target set.
+
+The compact D1 state stores the latest checkpoint per source prefix. The agent resumes from the greatest completed block position across those sparse rows and repeats that block only when it was active. If the normalized live prefix set changes, reset the compact cursor so newly announced ranges below the prior cursor are not skipped. The legacy `scan_blocks` table is retained; migration copies its completed progress into sparse checkpoints without deleting its historical rows.
 
 ### Report/checkpoint API
 
@@ -52,7 +54,7 @@ The request includes ASN, source prefix, block CIDR, progress state, and an opti
 
 ### D1 migration
 
-Add a scan-block table keyed by `(asn, block_cidr)`, containing source prefix, active/completed state, latest accepted IP (informational only), last report time, and timestamps. Existing `ip_records` and `app_settings` schemas and public route behavior remain unchanged.
+The initial schema includes a legacy scan-block table keyed by `(asn, block_cidr)`, containing source prefix, active/completed state, latest accepted IP (informational only), last report time, and timestamps. The compact-plan migration adds an ASN prefix snapshot and sparse checkpoint table; it copies completed progress from the legacy table while leaving its historical rows intact. Existing `ip_records` and `app_settings` schemas and public route behavior remain unchanged.
 
 ## 4. Agent workflow
 

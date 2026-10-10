@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { isIPv4WithinCIDR, planIPv4Blocks } from "../../src/shared/ipv4-prefixes";
+import { isIPv4CIDRWithinCIDR, isIPv4ScanBlock, isIPv4WithinCIDR, normalizeIPv4Prefixes, planIPv4Blocks } from "../../src/shared/ipv4-prefixes";
 
 describe("planIPv4Blocks", () => {
   it("splits a wider prefix into ascending /24 blocks", () => {
@@ -68,5 +68,33 @@ describe("isIPv4WithinCIDR", () => {
     expect(isIPv4WithinCIDR("8.8.9.1", "8.8.8.0/24")).toBe(false);
     expect(isIPv4WithinCIDR("2001:db8::1", "8.8.8.0/24")).toBe(false);
     expect(isIPv4WithinCIDR("bad", "8.8.8.0/24")).toBe(false);
+  });
+});
+
+
+describe("normalizeIPv4Prefixes", () => {
+  it("keeps the complete public source-prefix set compact and canonical", () => {
+    expect(normalizeIPv4Prefixes(["8.8.1.0/24", "8.8.0.1/23", "8.8.1.0/24", "10.0.0.0/8"]))
+      .toEqual(["8.8.0.0/23", "8.8.1.0/24"]);
+  });
+});
+
+describe("isIPv4CIDRWithinCIDR", () => {
+  it("checks complete CIDR containment rather than only the network address", () => {
+    expect(isIPv4CIDRWithinCIDR("8.8.8.0/24", "8.8.0.0/16")).toBe(true);
+    expect(isIPv4CIDRWithinCIDR("8.8.0.0/16", "8.8.8.0/24")).toBe(false);
+    expect(isIPv4CIDRWithinCIDR("8.8.0.0/23", "8.8.0.0/24")).toBe(false);
+  });
+});
+
+
+describe("isIPv4ScanBlock", () => {
+  it("accepts only aligned public blocks of the planner's size within the source", () => {
+    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/24")).toBe(true);
+    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.1.0/24")).toBe(true);
+    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/23")).toBe(false);
+    expect(isIPv4ScanBlock("8.8.0.0/24", "8.8.0.0/25")).toBe(false);
+    expect(isIPv4ScanBlock("8.8.0.1/23", "8.8.0.0/24")).toBe(false);
+    expect(isIPv4ScanBlock("10.0.0.0/24", "10.0.0.0/24")).toBe(false);
   });
 });

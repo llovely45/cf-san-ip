@@ -34,8 +34,10 @@ type Report struct {
 }
 
 type planResponse struct {
-	ASN    uint32         `json:"asn"`
-	Blocks []prefix.Block `json:"blocks"`
+	ASN         uint32              `json:"asn"`
+	Prefixes    []string            `json:"prefixes"`
+	Checkpoints []prefix.Checkpoint `json:"checkpoints"`
+	Blocks      []prefix.Block      `json:"blocks"`
 }
 
 type Client struct {
@@ -72,7 +74,7 @@ func newClient(baseURL, token string, httpClient *http.Client) (*Client, error) 
 	return &Client{baseURL: base, token: token, httpClient: httpClient}, nil
 }
 
-func (c *Client) Plan(ctx context.Context, asn uint32) ([]prefix.Block, error) {
+func (c *Client) Plan(ctx context.Context, asn uint32) (*prefix.Plan, error) {
 	if asn == 0 {
 		return nil, errors.New("ASN must be positive")
 	}
@@ -88,11 +90,21 @@ func (c *Client) Plan(ctx context.Context, asn uint32) ([]prefix.Block, error) {
 	if response.ASN != asn {
 		return nil, errors.New("backend scan plan ASN does not match the requested ASN")
 	}
-	blocks, err := prefix.ValidatePlan(asn, response.Blocks)
-	if err != nil {
-		return nil, fmt.Errorf("backend scan plan is invalid: %w", err)
+	if len(response.Prefixes) > 0 {
+		plan, err := prefix.NewPlan(asn, response.Prefixes, response.Checkpoints)
+		if err != nil {
+			return nil, fmt.Errorf("backend scan plan is invalid: %w", err)
+		}
+		return plan, nil
 	}
-	return blocks, nil
+	if response.Blocks != nil {
+		plan, err := prefix.NewPlanFromBlocks(asn, response.Blocks)
+		if err != nil {
+			return nil, fmt.Errorf("backend scan plan is invalid: %w", err)
+		}
+		return plan, nil
+	}
+	return nil, errors.New("backend returned an invalid scan plan")
 }
 
 func (c *Client) Report(ctx context.Context, report Report) error {

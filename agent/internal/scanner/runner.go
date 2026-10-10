@@ -70,12 +70,9 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 }
 
 func (r *Runner) Run(ctx context.Context, asn uint32, blocks []prefix.Block) error {
-	if r.Reporter == nil {
-		return errors.New("backend reporter is required")
-	}
-	config := r.normalizedConfig()
-	if config.Limit == 0 || config.Senders == 0 {
-		return errors.New("ZMap rate and ZGrab2 sender count must be positive")
+	config, err := r.validateRun()
+	if err != nil {
+		return err
 	}
 	pending, err := prefix.PendingBlocks(asn, blocks)
 	if err != nil {
@@ -90,6 +87,33 @@ func (r *Runner) Run(ctx context.Context, asn uint32, blocks []prefix.Block) err
 		}
 	}
 	return nil
+}
+
+func (r *Runner) RunPlan(ctx context.Context, plan *prefix.Plan) error {
+	if plan == nil {
+		return errors.New("backend scan plan is required")
+	}
+	config, err := r.validateRun()
+	if err != nil {
+		return err
+	}
+	return plan.ForEachPending(func(block prefix.Block) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return r.runBlock(ctx, plan.ASN(), block, config)
+	})
+}
+
+func (r *Runner) validateRun() (RunnerConfig, error) {
+	if r.Reporter == nil {
+		return RunnerConfig{}, errors.New("backend reporter is required")
+	}
+	config := r.normalizedConfig()
+	if config.Limit == 0 || config.Senders == 0 {
+		return RunnerConfig{}, errors.New("ZMap rate and ZGrab2 sender count must be positive")
+	}
+	return config, nil
 }
 
 func (r *Runner) runBlock(

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentRoutes } from "../../src/worker/routes/agent";
 import { D1IpRepository } from "../../src/worker/repositories/ip-records";
 import { D1SettingsRepository } from "../../src/worker/repositories/settings";
+import { D1ScanCheckpointRepository } from "../../src/worker/repositories/scan-checkpoints";
 
 const db = (env as typeof env & { DB: D1Database }).DB;
 const asn = 64512;
@@ -42,32 +43,89 @@ const report = (overrides: Record<string, unknown> = {}) => ({
 describe("agent plan and report API", () => {
   beforeEach(async () => {
     await db.prepare("DELETE FROM scan_blocks").run();
+    await db.prepare("DELETE FROM scan_checkpoints").run();
+    await db.prepare("DELETE FROM scan_plan_snapshots").run();
     await db.prepare("DELETE FROM ip_records").run();
     await new D1SettingsRepository(db).setApiToken("agent-test-token");
   });
 
-  it("returns numeric current blocks and preserves completed state across plan refreshes", async () => {
+  it("returns compact source prefixes and preserves checkpoints across plan refreshes", async () => {
     const routes = makeRoutes(["8.8.9.0/24", "8.8.8.0/23"]);
     const first = await request(routes, `/plan?asn=${asn}`);
     expect(first.status).toBe(200);
     expect(await first.json()).toEqual({
       asn,
-      blocks: [
-        { sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/24", status: "active", latestIp: null },
-        { sourcePrefix: "8.8.9.0/24", blockCidr: "8.8.9.0/24", status: "active", latestIp: null },
-      ],
+      prefixes: ["8.8.8.0/23", "8.8.9.0/24"],
+      checkpoints: [],
     });
 
-    await request(
+    const completed = await request(
       routes,
       "/report",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report({ status: "completed", sourcePrefix: "8.8.8.0/23" })) },
     );
-    const second = await request(makeRoutes(["8.8.8.0/23"]), `/plan?asn=${asn}`);
-    const secondBody = await second.json() as { blocks: Array<{ blockCidr: string; status: string }> };
-    expect(secondBody.blocks.find((block) => block.blockCidr === "8.8.8.0/24")).toMatchObject({
-      status: "completed",
+    expect(completed.status).toBe(200);
+    const second = await request(makeRoutes(["8.8.8.0/23", "8.8.9.0/24"]), `/plan?asn=${asn}`);
+    const secondBody = await second.json() as { prefixes: string[]; checkpoints: Array<{ blockCidr: string; status: string }> };
+    expect(secondBody.prefixes).toEqual(["8.8.8.0/23", "8.8.9.0/24"]);
+    expect(secondBody.checkpoints).toEqual([
+      { sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/24", status: "completed", latestIp: null },
+    ]);
+  });
+
+  it("returns the compact source-prefix plan without materializing every /24 row", async () => {
+    const response = await request(makeRoutes(["8.8.0.0/14"]), `/plan?asn=${asn}`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      asn,
+      prefixes: ["8.8.0.0/14"],
+      checkpoints: [],
     });
+    const oldRows = await db.prepare("SELECT COUNT(*) AS count FROM scan_blocks WHERE asn = ?")
+      .bind(asn).first<{ count: number }>();
+    expect(oldRows?.count).toBe(0);
+  });
+
+  it("keeps the complete 681605-block range without materializing block rows", async () => {
+    const prefixes = [
+      ...Array.from({ length: 10 }, (_, index) => `${11 + index}.0.0.0/8`),
+      ...Array.from({ length: 26 }, (_, index) => `21.${index}.0.0/16`),
+      ...Array.from({ length: 153 }, (_, index) =>
+        `22.${Math.floor(index / 2)}.${index % 2 === 0 ? 0 : 128}.0/17`,
+      ),
+      ...Array.from({ length: 5 }, (_, index) => `23.0.${index}.0/24`),
+    ];
+    const expandedBlockCount = prefixes.reduce((count, cidr) => {
+      const prefixLength = Number(cidr.split("/")[1]);
+      return count + 2 ** Math.max(24 - prefixLength, 0);
+    }, 0);
+    expect(expandedBlockCount).toBe(681_605);
+
+    const response = await request(makeRoutes(prefixes), `/plan?asn=${asn}`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { prefixes: string[]; checkpoints: unknown[] };
+    expect(body.prefixes).toHaveLength(prefixes.length);
+    expect(new Set(body.prefixes)).toEqual(new Set(prefixes));
+    expect(body.checkpoints).toEqual([]);
+    const oldRows = await db.prepare("SELECT COUNT(*) AS count FROM scan_blocks WHERE asn = ?")
+      .bind(asn).first<{ count: number }>();
+    expect(oldRows?.count).toBe(0);
+  });
+
+  it("handles an ASN with tens of thousands of prefixes in a bounded compact response", async () => {
+    const prefixes = Array.from({ length: 19_152 }, (_, index) =>
+      `11.${Math.floor(index / 256)}.${index % 256}.0/24`,
+    );
+    const response = await request(makeRoutes(prefixes), `/plan?asn=${asn}`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { prefixes: string[]; checkpoints: unknown[] };
+    expect(body.prefixes).toHaveLength(19_152);
+    expect(body.checkpoints).toEqual([]);
+    expect(new TextEncoder().encode(JSON.stringify({ asn, ...body })).byteLength)
+      .toBeLessThan(5 * 1024 * 1024);
+    const materializedBlocks = await db.prepare("SELECT COUNT(*) AS count FROM scan_blocks WHERE asn = ?")
+      .bind(asn).first<{ count: number }>();
+    expect(materializedBlocks?.count).toBe(0);
   });
 
   it("requests only RIPEstat originating IPv4 prefixes for the selected ASN", async () => {
@@ -84,15 +142,41 @@ describe("agent plan and report API", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("retains withdrawn scan history but omits withdrawn blocks from current plans", async () => {
-    const first = await request(makeRoutes(["8.8.8.0/24"]), `/plan?asn=${asn}`);
-    expect(first.status).toBe(200);
-    const second = await request(makeRoutes(["8.8.9.0/24"]), `/plan?asn=${asn}`);
-    expect(await second.json()).toMatchObject({
-      blocks: [{ blockCidr: "8.8.9.0/24" }],
+  it("resets the cursor when the announced prefix set changes", async () => {
+    const routes = makeRoutes(["8.8.8.0/24"]);
+    await request(routes, `/plan?asn=${asn}`);
+    await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({ status: "completed" })),
     });
-    const history = await db.prepare("SELECT block_cidr FROM scan_blocks WHERE asn = ? ORDER BY block_cidr").bind(asn).all<{ block_cidr: string }>();
-    expect(history.results.map((row) => row.block_cidr)).toEqual(["8.8.8.0/24", "8.8.9.0/24"]);
+    const second = await request(makeRoutes(["8.8.7.0/24", "8.8.8.0/24", "8.8.9.0/24"]), `/plan?asn=${asn}`);
+    expect(await second.json()).toEqual({
+      asn,
+      prefixes: ["8.8.7.0/24", "8.8.8.0/24", "8.8.9.0/24"],
+      checkpoints: [],
+    });
+    const checkpoints = await db.prepare("SELECT source_prefix FROM scan_checkpoints WHERE asn = ?")
+      .bind(asn).all<{ source_prefix: string }>();
+    expect(checkpoints.results).toEqual([]);
+  });
+
+  it("does not regress a completed checkpoint when a stale active report arrives", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({ status: "completed" })),
+    });
+    const stale = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({ status: "active", latestIp: "8.8.8.7" })),
+    });
+    expect(stale.status).toBe(200);
+    expect(await db.prepare("SELECT status FROM scan_checkpoints WHERE asn = ?")
+      .bind(asn).first()).toMatchObject({ status: "completed" });
   });
 
   it("fails closed on malformed, non-success, and empty RIPEstat data", async () => {
@@ -188,6 +272,6 @@ describe("agent plan and report API", () => {
     });
     expect(response.status).toBe(200);
     expect(await db.prepare("SELECT * FROM ip_records").all()).toMatchObject({ results: [] });
-    expect(await db.prepare("SELECT latest_ip FROM scan_blocks WHERE asn = ?").bind(asn).first()).toMatchObject({ latest_ip: "8.8.8.7" });
+    expect(await db.prepare("SELECT latest_ip FROM scan_checkpoints WHERE asn = ?").bind(asn).first()).toMatchObject({ latest_ip: "8.8.8.7" });
   });
 });

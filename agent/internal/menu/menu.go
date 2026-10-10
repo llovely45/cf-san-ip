@@ -14,7 +14,6 @@ import (
 
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
-	"cf-san/internal/prefix"
 )
 
 type App struct {
@@ -163,15 +162,11 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	blocks, err := client.Plan(context.Background(), cfg.ASN)
+	plan, err := client.Plan(context.Background(), cfg.ASN)
 	if err != nil {
 		return err
 	}
-	pending, err := prefix.PendingBlocks(cfg.ASN, blocks)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(app.Output, "后端连接正常；当前 ASN %d 有 %d 个块，其中 %d 个待扫描。\n", cfg.ASN, len(blocks), len(pending))
+	fmt.Fprintf(app.Output, "后端连接正常；当前 ASN %d 有 %d 个来源前缀，扫描断点已载入。\n", cfg.ASN, plan.PrefixCount())
 	return nil
 }
 

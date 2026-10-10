@@ -1,11 +1,11 @@
 import { Hono } from "hono";
 
-import { isIPv4WithinCIDR, planIPv4Blocks } from "../../shared/ipv4-prefixes";
+import { isIPv4ScanBlock, isIPv4WithinCIDR, normalizeIPv4Prefixes } from "../../shared/ipv4-prefixes";
 import { validateIpInput } from "../../shared/ip";
 import type { Env } from "../env";
 import { apiTokenMiddleware, createApiTokenMiddleware } from "../middleware/api-token";
-import { D1ScanBlockRepository } from "../repositories/scan-blocks";
-import type { ScanBlockStatus, ScanProgress } from "../repositories/scan-blocks";
+import type { ScanBlockStatus } from "../repositories/scan-blocks";
+import { D1ScanCheckpointRepository, type ScanProgress } from "../repositories/scan-checkpoints";
 import { fetchOriginatingIPv4Prefixes } from "../services/ripe-prefixes";
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -49,19 +49,21 @@ export function createAgentRoutes(
       return context.json({ error: "invalid_asn" }, 400);
     }
 
-    let planned;
+    let prefixes: string[];
     try {
-      const prefixes = await fetchOriginatingIPv4Prefixes(asn, fetchImplementation);
-      planned = planIPv4Blocks(asn, prefixes);
-      if (planned.length === 0) {
+      const originating = await fetchOriginatingIPv4Prefixes(asn, fetchImplementation);
+      prefixes = normalizeIPv4Prefixes(originating);
+      if (prefixes.length === 0) {
         return context.json({ error: "prefix_source_unavailable" }, 502);
       }
     } catch {
       return context.json({ error: "prefix_source_unavailable" }, 502);
     }
 
-    const blocks = await new D1ScanBlockRepository(resolveDb(context)).syncCurrentPlan(asn, planned);
-    return context.json({ asn, blocks });
+    const repository = new D1ScanCheckpointRepository(resolveDb(context));
+    await repository.savePlan(asn, prefixes);
+    const checkpoints = await repository.list(asn, prefixes);
+    return context.json({ asn, prefixes, checkpoints });
   });
 
   routes.post("/report", async (context) => {
@@ -85,7 +87,8 @@ export function createAgentRoutes(
       asn <= 0 ||
       typeof sourcePrefix !== "string" ||
       typeof blockCidr !== "string" ||
-      status === null
+      status === null ||
+      !isIPv4ScanBlock(sourcePrefix, blockCidr)
     ) {
       return context.json({ error: "invalid_report" }, 400);
     }
@@ -101,9 +104,8 @@ export function createAgentRoutes(
       latestIp = input.latestIp;
     }
 
-    const repository = new D1ScanBlockRepository(resolveDb(context));
-    const plannedBlock = await repository.find(asn, blockCidr);
-    if (plannedBlock === null || plannedBlock.sourcePrefix !== sourcePrefix) {
+    const repository = new D1ScanCheckpointRepository(resolveDb(context));
+    if (!(await repository.isInCurrentPlan(asn, sourcePrefix))) {
       return context.json({ error: "scan_block_not_found" }, 404);
     }
 
@@ -116,10 +118,7 @@ export function createAgentRoutes(
     };
 
     if (input.candidate === undefined) {
-      const updated = await repository.updateProgress(progress);
-      if (!updated) {
-        return context.json({ error: "scan_block_not_found" }, 404);
-      }
+      await repository.updateProgress(progress);
       return context.json({ ok: true });
     }
 
@@ -142,10 +141,7 @@ export function createAgentRoutes(
       return context.json({ error: "invalid_candidate" }, 400);
     }
 
-    await repository.upsertCandidateAndProgress(progress, {
-      ...candidate.value,
-      asnAlias: null,
-    });
+    await repository.upsertCandidateAndProgress(progress, candidate.value);
     return context.json({ ok: true });
   });
 

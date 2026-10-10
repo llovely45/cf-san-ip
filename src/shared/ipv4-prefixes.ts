@@ -90,6 +90,23 @@ function formatIPv4(value: number): string {
   ].join(".");
 }
 
+export function normalizeIPv4Prefixes(prefixes: string[]): string[] {
+  const unique = new Map<string, ParsedPrefix>();
+  for (const value of prefixes) {
+    const parsed = parsePrefix(value);
+    if (parsed !== null && isPublicPrefix(parsed)) {
+      unique.set(parsed.canonical, parsed);
+    }
+  }
+  return [...unique.values()]
+    .sort((left, right) =>
+      left.network - right.network ||
+      left.prefixLength - right.prefixLength ||
+      left.canonical.localeCompare(right.canonical),
+    )
+    .map((prefix) => prefix.canonical);
+}
+
 export function planIPv4Blocks(
   asn: number,
   prefixes: string[],
@@ -135,6 +152,25 @@ export function planIPv4Blocks(
       );
     })
     .map(({ sourcePrefixLength: _sourcePrefixLength, ...block }) => block);
+}
+
+export function isIPv4ScanBlock(sourcePrefix: string, blockCIDR: string): boolean {
+  const source = parsePrefix(sourcePrefix);
+  const block = parsePrefix(blockCIDR);
+  return source !== null && block !== null &&
+    source.canonical === sourcePrefix && block.canonical === blockCIDR &&
+    isPublicPrefix(source) && isPublicPrefix(block) &&
+    block.prefixLength === Math.max(source.prefixLength, 24) &&
+    block.network >= source.network && block.last <= source.last;
+}
+
+export function isIPv4CIDRWithinCIDR(childCIDR: string, parentCIDR: string): boolean {
+  const child = parsePrefix(childCIDR);
+  const parent = parsePrefix(parentCIDR);
+  return child !== null && parent !== null &&
+    child.prefixLength >= parent.prefixLength &&
+    child.network >= parent.network &&
+    child.last <= parent.last;
 }
 
 export function isIPv4WithinCIDR(ip: string, cidr: string): boolean {

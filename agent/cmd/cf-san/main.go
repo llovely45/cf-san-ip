@@ -15,7 +15,6 @@ import (
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
 	"cf-san/internal/menu"
-	"cf-san/internal/prefix"
 	"cf-san/internal/scanner"
 )
 
@@ -162,15 +161,11 @@ func runScan(cfg config.Config, configPath string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	blocks, err := client.Plan(ctx, cfg.ASN)
+	plan, err := client.Plan(ctx, cfg.ASN)
 	if err != nil {
 		return err
 	}
-	pending, err := prefix.PendingBlocks(cfg.ASN, blocks)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stdout, "ASN %d: %d current blocks, %d pending\n", cfg.ASN, len(blocks), len(pending))
+	fmt.Fprintf(os.Stdout, "ASN %d: %d current source prefixes; scanning pending blocks in ascending order\n", cfg.ASN, plan.PrefixCount())
 	manager := menu.NewManager()
 	pid := os.Getpid()
 	defer manager.RemoveIfCurrent(pid)
@@ -183,7 +178,7 @@ func runScan(cfg config.Config, configPath string) error {
 		},
 		Reporter: client,
 	}
-	if err := runner.Run(ctx, cfg.ASN, blocks); err != nil {
+	if err := runner.RunPlan(ctx, plan); err != nil {
 		return err
 	}
 	fmt.Fprintln(os.Stdout, "当前 ASN 扫描计划已完成。")
