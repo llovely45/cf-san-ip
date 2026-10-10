@@ -41,6 +41,7 @@ export default function TokenSettings({
     setMessage("");
     try {
       await onGenerateToken();
+      setNewToken("");
       setMessage("新 Token 已生成，请安全保存。");
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Token 生成失败。");

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { IpRecord } from "../shared/ip";
 import AliasEditor from "./components/AliasEditor";
@@ -41,6 +41,7 @@ export default function App({ api = clientApi }: AppProps) {
   const [editor, setEditor] = useState<RecordEditorState | null>(null);
   const [notice, setNotice] = useState("");
   const [globalError, setGlobalError] = useState("");
+  const recordRequestSequence = useRef(0);
 
   const returnToLogin = (message = "登录状态已失效，请重新登录。") => {
     setRows([]);
@@ -113,20 +114,29 @@ export default function App({ api = clientApi }: AppProps) {
     nextPage: number,
     nextPageSize: PageSize,
   ): Promise<boolean> => {
+    const requestSequence = ++recordRequestSequence.current;
     setLoading(true);
     setGlobalError("");
     try {
       const result = await api.listRecords(nextPage, nextPageSize);
+      if (requestSequence !== recordRequestSequence.current) {
+        return true;
+      }
       setRows(result.rows);
       setTotal(result.total);
       setPage(nextPage);
       setPageSize(nextPageSize);
       return true;
     } catch (error) {
+      if (requestSequence !== recordRequestSequence.current) {
+        return false;
+      }
       handleProtectedError(error);
       return false;
     } finally {
-      setLoading(false);
+      if (requestSequence === recordRequestSequence.current) {
+        setLoading(false);
+      }
     }
   };
 

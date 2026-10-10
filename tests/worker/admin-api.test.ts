@@ -109,6 +109,36 @@ describe("authenticated management APIs", () => {
     expect(invalidPageSize.status).toBe(400);
   });
 
+  it("creates a record with an explicit null alias", async () => {
+    const repository = new D1IpRepository(db);
+    const response = await jsonRequest(
+      "/api/admin/records",
+      "POST",
+      {
+        ip: "192.0.2.11",
+        port: 443,
+        asn: 906,
+        region: "US",
+        asn_alias: null,
+      },
+      cookie,
+    );
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      record: {
+        ip: "192.0.2.11",
+        port: 443,
+        asn: 906,
+        region: "US",
+        asn_alias: null,
+      },
+    });
+    expect(await repository.getByIp("192.0.2.11")).toMatchObject({
+      asnAlias: null,
+    });
+  });
+
   it("supports the remaining allowed page sizes", async () => {
     const repository = new D1IpRepository(db);
     for (let index = 1; index <= 101; index += 1) {
@@ -164,6 +194,38 @@ describe("authenticated management APIs", () => {
       asn: 906,
       region: "DE",
       asnAlias: "NEW",
+    });
+  });
+
+  it("clears a record alias when an edit sends an explicit null", async () => {
+    const repository = new D1IpRepository(db);
+    await repository.upsert(makeRecord("192.0.2.22", 906, "OLD"));
+
+    const response = await jsonRequest(
+      "/api/admin/records/192.0.2.22",
+      "PUT",
+      {
+        ip: "192.0.2.22",
+        port: 443,
+        asn: 906,
+        region: "US",
+        asn_alias: null,
+      },
+      cookie,
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      record: {
+        ip: "192.0.2.22",
+        port: 443,
+        asn: 906,
+        region: "US",
+        asn_alias: null,
+      },
+    });
+    expect(await repository.getByIp("192.0.2.22")).toMatchObject({
+      asnAlias: null,
     });
   });
 

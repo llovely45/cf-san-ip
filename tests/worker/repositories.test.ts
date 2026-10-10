@@ -102,6 +102,20 @@ describe("D1 repositories", () => {
     expect(await repository.setAliasForAsn(64501, "unused")).toBe(0);
   });
 
+  it("inherits the alias from the lowest IP when aliases conflict", async () => {
+    const repository = new D1IpRepository(db);
+    await repository.upsert({
+      ...makeRecord(42, 906),
+      asnAlias: "HIGHER-IP",
+    });
+    await repository.upsert({
+      ...makeRecord(41, 906),
+      asnAlias: "LOWER-IP",
+    });
+
+    expect(await repository.findAliasByAsn(906)).toBe("LOWER-IP");
+  });
+
   it("samples from all records or only the requested ASN", async () => {
     const repository = new D1IpRepository(db);
     const records = [
@@ -119,8 +133,11 @@ describe("D1 repositories", () => {
     expect(asnRows).toHaveLength(3);
     expect(asnRows.every((row) => row.asn === 906)).toBe(true);
 
-    const allRows = await repository.sample(2, null);
-    expect(allRows).toHaveLength(2);
+    const allRows = await repository.sample(records.length, null);
+    expect(allRows).toHaveLength(records.length);
+    expect(new Set(allRows.map((row) => row.asn))).toEqual(
+      new Set([906, 64500]),
+    );
     expect(
       allRows.every((row) => records.some((record) => record.ip === row.ip)),
     ).toBe(true);

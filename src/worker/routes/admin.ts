@@ -29,7 +29,11 @@ function mapWireRecord(input: unknown): unknown {
   const mapped = { ...input };
   delete mapped.asnAlias;
   if (Object.hasOwn(input, "asn_alias")) {
-    mapped.asnAlias = input.asn_alias;
+    if (input.asn_alias === null) {
+      delete mapped.asnAlias;
+    } else {
+      mapped.asnAlias = input.asn_alias;
+    }
   }
   delete mapped.asn_alias;
   return mapped;

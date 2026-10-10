@@ -111,6 +111,7 @@ export class D1IpRepository implements IpRepository {
         `SELECT asn_alias
          FROM ip_records
          WHERE asn = ? AND asn_alias IS NOT NULL
+         ORDER BY ip ASC
          LIMIT 1`,
       )
       .bind(asn)

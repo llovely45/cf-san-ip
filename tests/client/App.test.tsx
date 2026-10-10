@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -44,6 +44,14 @@ function createAuthenticatedApi(overrides: Partial<ClientApi> = {}): ClientApi {
     getToken: vi.fn().mockResolvedValue({ token: "existing-token" }),
     ...overrides,
   });
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 describe("App setup and authentication", () => {
@@ -175,6 +183,43 @@ describe("paginated records", () => {
     await waitFor(() => expect(listRecords).toHaveBeenLastCalledWith(1, 50));
   });
 
+  it("ignores an older page-size response that resolves after the latest one", async () => {
+    const user = userEvent.setup();
+    const olderResult = createDeferred<{ rows: IpRecord[]; total: number }>();
+    const latestResult = createDeferred<{ rows: IpRecord[]; total: number }>();
+    const olderRecord = { ...firstRecord, ip: "192.0.2.50" };
+    const latestRecord = { ...firstRecord, ip: "192.0.2.100" };
+    const listRecords = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: [firstRecord], total: 120 })
+      .mockReturnValueOnce(olderResult.promise)
+      .mockReturnValueOnce(latestResult.promise);
+    const api = createAuthenticatedApi({ listRecords });
+
+    render(<App api={api} />);
+    await screen.findByText(firstRecord.ip);
+
+    const pageSize = screen.getByLabelText("每页条数") as HTMLSelectElement;
+    await user.selectOptions(pageSize, "50");
+    await user.selectOptions(pageSize, "100");
+    expect(listRecords).toHaveBeenNthCalledWith(2, 1, 50);
+    expect(listRecords).toHaveBeenNthCalledWith(3, 1, 100);
+
+    await act(async () => {
+      latestResult.resolve({ rows: [latestRecord], total: 120 });
+    });
+    expect(await screen.findByText(latestRecord.ip)).toBeTruthy();
+    await waitFor(() => expect(pageSize.value).toBe("100"));
+
+    await act(async () => {
+      olderResult.resolve({ rows: [olderRecord], total: 120 });
+    });
+
+    expect(screen.getByText(latestRecord.ip)).toBeTruthy();
+    expect(screen.queryByText(olderRecord.ip)).toBeNull();
+    expect(pageSize.value).toBe("100");
+  });
+
   it("saves edits as an update using the original IP key", async () => {
     const user = userEvent.setup();
     const updatedRecord = { ...firstRecord, ip: "192.0.2.11", port: 8443 };
@@ -275,6 +320,7 @@ describe("ASN alias and token settings", () => {
     try {
       render(<App api={api} />);
       const tokenPanel = await screen.findByRole("region", { name: "Token 设置" });
+      await user.type(within(tokenPanel).getByLabelText("设置 API Token"), "manual-draft");
       await user.click(within(tokenPanel).getByRole("button", { name: "生成 Token" }));
 
       await waitFor(() =>
@@ -282,6 +328,10 @@ describe("ASN alias and token settings", () => {
           "generated-token",
         ),
       );
+      expect(
+        (within(tokenPanel).getByLabelText("设置 API Token") as HTMLInputElement)
+          .value,
+      ).toBe("");
       expect(api.generateToken).toHaveBeenCalledOnce();
       await user.click(within(tokenPanel).getByRole("button", { name: "复制 Token" }));
       expect(writeText).toHaveBeenCalledWith("generated-token");
