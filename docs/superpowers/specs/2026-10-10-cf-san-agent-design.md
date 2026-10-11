@@ -21,7 +21,7 @@ It does not change the existing public `/postip` and `/getip` contracts, and it 
 
 - Scan only authorized, currently announced IPv4 prefixes for the selected ASN; do not expand the target scope to other ASNs or Cloudflare-wide ranges.
 - Obtain originating prefixes from RIPEstat RIS Prefixes (`types=o`, `af=v4`, with noise filtering), sort prefixes numerically, then scan ascending blocks.
-- Split prefixes into `/24` blocks. A prefix narrower than `/24` remains one smaller block. ZMap may permute addresses inside each block.
+- Split prefixes into ascending blocks no larger than `/16`. A source narrower than `/16` remains one block. ZMap may permute addresses inside each block.
 - Persist completion at block granularity. A pause or crash during a block leaves that block incomplete; the next run may rescan it. Completed blocks are not rescanned during the same plan.
 - Finish one pass and stop. On a later run, refresh the ASN prefix plan and add new blocks. A withdrawn prefix is no longer scheduled; its history is retained.
 - Region is parsed from `loc=` in the trace response. If the response has no usable `loc`, it is not accepted as a Cloudflare edge record and is not stored.
@@ -40,7 +40,7 @@ Add an API-token-protected endpoint:
 
 - `GET /api/agent/v1/plan?asn=<number>`
 
-The Worker fetches the current RIPEstat originating IPv4 prefix set for the ASN, rejects invalid or non-public prefixes, normalizes and sorts the complete prefix set, then returns it with sparse checkpoints. It must not materialize or persist one D1 row per `/24`: a large ASN may produce hundreds of thousands of scan blocks. The Go agent lazily merges the prefix ranges into the same numerically ordered `/24` blocks (keeping prefixes narrower than `/24` intact), preserving the existing target range and block ordering. If the live prefix source cannot be reached or validated, fail closed and do not start a new scan using an unverified target set.
+The Worker fetches the current RIPEstat originating IPv4 prefix set for the ASN, rejects invalid or non-public prefixes, normalizes and sorts the complete prefix set, then returns it with sparse checkpoints. It must not materialize or persist one D1 row per scan block. The Go agent lazily merges the prefix ranges into numerically ordered blocks no larger than `/16` (keeping narrower prefixes intact), removes nested routes already covered by a broader route, and preserves the authorized target range. Existing `/24` checkpoints are mapped to their containing new block and conservatively rescanned; exact new-format checkpoints take precedence over stale legacy checkpoints. If the live prefix source cannot be reached or validated, fail closed and do not start a new scan using an unverified target set.
 
 The compact D1 state stores the latest checkpoint per source prefix. The agent resumes from the greatest completed block position across those sparse rows and repeats that block only when it was active. If the normalized live prefix set changes, reset the compact cursor so newly announced ranges below the prior cursor are not skipped. The legacy `scan_blocks` table is retained; migration copies its completed progress into sparse checkpoints without deleting its historical rows.
 
@@ -60,8 +60,8 @@ The initial schema includes a legacy scan-block table keyed by `(asn, block_cidr
 
 1. Load saved configuration and contact the Worker over HTTPS with the Bearer token. Fail before scanning if authentication, backend connectivity, ASN configuration, or plan retrieval fails.
 2. Fetch and synchronize the current plan; process blocks in ascending numeric order.
-3. For each block, run ZMap against TCP/443 with the configured `--limit`. Feed open-port results to ZGrab2 with the configured sender count for TLS/HTTP follow-up.
-4. For candidates, issue a direct HTTPS GET to the IP at `/cdn-cgi/trace`. Certificate verification may be disabled only for this public IP probe; the agent's connection to its backend must use normal TLS verification and must never forward the API token to scan targets.
+3. For each block, run ZMap against TCP/443 with the configured `--limit` and a one-second cooldown for delayed responses. Feed open-port results to ZGrab2 with the configured sender count and one-second connect/target timeouts.
+4. For candidates, issue a direct HTTPS GET to the IP at `/cdn-cgi/trace` with one-second dial, TLS handshake, response-header, and overall request timeouts. Certificate verification may be disabled only for this public IP probe; the agent's connection to its backend must use normal TLS verification and must never forward the API token to scan targets.
 5. Apply the agreed header/body check, parse `loc=`, and immediately report only valid records with port `443`, the selected ASN, and the parsed region. Responses without `loc` are treated as non-qualifying and are not stored.
 6. Send a heartbeat every ten minutes and a final block-completion report. Invalid probes never create records.
 7. On pause or termination, stop dispatching new work and leave the active block incomplete so it is safely rescanned on resume.

@@ -23,13 +23,14 @@ type planPrefix struct {
 	step     uint64
 }
 
-// Plan keeps source prefixes and sparse checkpoints, not one object per /24.
+// Plan keeps source prefixes and sparse checkpoints, not one object per /16.
 // Large ASNs therefore have bounded plan memory regardless of their block count.
 type Plan struct {
-	asn      uint32
-	prefixes []planPrefix
-	cursor   *Checkpoint
-	legacy   []Block
+	asn         uint32
+	prefixCount int
+	prefixes    []planPrefix
+	cursor      *Checkpoint
+	legacy      []Block
 }
 
 func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, error) {
@@ -50,7 +51,7 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 			return nil, fmt.Errorf("plan contains a non-canonical source prefix")
 		}
 		start, end := ipv4Range(parsed)
-		blockBit := max(parsed.Bits(), 24)
+		blockBit := max(parsed.Bits(), 16)
 		step := uint64(1) << (32 - blockBit)
 		unique[value] = planPrefix{
 			source: value, prefix: parsed, blockBit: blockBit,
@@ -61,37 +62,58 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 		return nil, fmt.Errorf("backend returned an empty scan plan")
 	}
 
-	ordered := make([]planPrefix, 0, len(unique))
+	allSources := make([]planPrefix, 0, len(unique))
 	for _, source := range unique {
-		ordered = append(ordered, source)
+		allSources = append(allSources, source)
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		if ordered[i].start != ordered[j].start {
-			return ordered[i].start < ordered[j].start
+	sort.Slice(allSources, func(i, j int) bool {
+		if allSources[i].start != allSources[j].start {
+			return allSources[i].start < allSources[j].start
 		}
-		if ordered[i].prefix.Bits() != ordered[j].prefix.Bits() {
-			return ordered[i].prefix.Bits() < ordered[j].prefix.Bits()
+		if allSources[i].prefix.Bits() != allSources[j].prefix.Bits() {
+			return allSources[i].prefix.Bits() < allSources[j].prefix.Bits()
 		}
-		return ordered[i].source < ordered[j].source
+		return allSources[i].source < allSources[j].source
 	})
-	prefixBySource := make(map[string]int, len(ordered))
-	for index := range ordered {
-		prefixBySource[ordered[index].source] = index
+
+	// CIDR overlap is containment. Keep the broadest route and assign nested
+	// routes to it so their old checkpoints can be conservatively migrated.
+	ordered := make([]planPrefix, 0, len(allSources))
+	ownerBySource := make(map[string]string, len(allSources))
+	for _, source := range allSources {
+		if len(ordered) > 0 {
+			previous := ordered[len(ordered)-1]
+			if previous.prefix.Contains(source.prefix.Addr()) {
+				ownerBySource[source.source] = previous.source
+				continue
+			}
+		}
+		ordered = append(ordered, source)
+		ownerBySource[source.source] = source.source
+	}
+	ownerByPrefix := make(map[string]planPrefix, len(ordered))
+	for _, source := range ordered {
+		ownerByPrefix[source.source] = source
 	}
 
-	var cursor *Checkpoint
-	var cursorNetwork uint64
-	cursorBits := -1
-	seenCheckpoints := make(map[string]struct{}, len(checkpoints))
+	legacyByBlock := make(map[string]Checkpoint, len(checkpoints))
+	exactByBlock := make(map[string]Checkpoint, len(checkpoints))
+	type checkpointKey struct {
+		source string
+		block  string
+	}
+	seenCheckpoints := make(map[checkpointKey]struct{}, len(checkpoints))
 	for _, checkpoint := range checkpoints {
-		index, exists := prefixBySource[checkpoint.SourcePrefix]
+		source, exists := unique[checkpoint.SourcePrefix]
 		if !exists {
 			return nil, fmt.Errorf("checkpoint references a source prefix outside the current plan")
 		}
-		if _, duplicate := seenCheckpoints[checkpoint.SourcePrefix]; duplicate {
-			return nil, fmt.Errorf("plan contains a duplicate source-prefix checkpoint")
+		key := checkpointKey{source: checkpoint.SourcePrefix, block: checkpoint.BlockCIDR}
+		if _, duplicate := seenCheckpoints[key]; duplicate {
+			return nil, fmt.Errorf("plan contains a duplicate scan-block checkpoint")
 		}
-		seenCheckpoints[checkpoint.SourcePrefix] = struct{}{}
+		seenCheckpoints[key] = struct{}{}
+
 		block, err := validateBlock(Block{
 			SourcePrefix: checkpoint.SourcePrefix,
 			BlockCIDR:    checkpoint.BlockCIDR,
@@ -100,7 +122,11 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 		if err != nil {
 			return nil, err
 		}
-		if block.Bits() != ordered[index].blockBit || block != block.Masked() {
+		// Accept the old /24 planner's checkpoints during upgrade. If an old
+		// checkpoint covers only part of a new larger block, rescan that whole
+		// new block rather than treating it as completed.
+		legacyBlockBit := max(source.prefix.Bits(), 24)
+		if block.Bits() != source.blockBit && block.Bits() != legacyBlockBit {
 			return nil, fmt.Errorf("checkpoint contains an invalid scan block")
 		}
 		if checkpoint.LatestIP != nil {
@@ -109,6 +135,47 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 				return nil, fmt.Errorf("checkpoint contains an invalid latest IP")
 			}
 		}
+
+		ownerName := ownerBySource[checkpoint.SourcePrefix]
+		owner := ownerByPrefix[ownerName]
+		newBlock := netip.PrefixFrom(block.Addr(), owner.blockBit).Masked()
+		newBlockCIDR := newBlock.String()
+		mapped := Checkpoint{
+			SourcePrefix: owner.source,
+			BlockCIDR:    newBlockCIDR,
+			Status:       "active",
+			LatestIP:     checkpoint.LatestIP,
+		}
+		isExact := checkpoint.SourcePrefix == owner.source &&
+			checkpoint.BlockCIDR == newBlockCIDR && block.Bits() == owner.blockBit
+		if isExact {
+			mapped.Status = checkpoint.Status
+			if previous, ok := exactByBlock[newBlockCIDR]; ok && previous.SourcePrefix != mapped.SourcePrefix {
+				return nil, fmt.Errorf("plan contains conflicting exact checkpoints")
+			}
+			exactByBlock[newBlockCIDR] = mapped
+			continue
+		}
+		if previous, ok := legacyByBlock[newBlockCIDR]; !ok || (previous.LatestIP == nil && mapped.LatestIP != nil) {
+			legacyByBlock[newBlockCIDR] = mapped
+		}
+	}
+
+	// A checkpoint already written in the new format wins over any stale
+	// child/legacy checkpoint that maps to the same larger block.
+	effective := make(map[string]Checkpoint, len(legacyByBlock)+len(exactByBlock))
+	for blockCIDR, checkpoint := range legacyByBlock {
+		effective[blockCIDR] = checkpoint
+	}
+	for blockCIDR, checkpoint := range exactByBlock {
+		effective[blockCIDR] = checkpoint
+	}
+
+	var cursor *Checkpoint
+	var cursorNetwork uint64
+	cursorBits := -1
+	for _, checkpoint := range effective {
+		block, _ := netip.ParsePrefix(checkpoint.BlockCIDR)
 		checkpointNetwork, _ := ipv4Range(block)
 		if cursor == nil || comparePlanPosition(checkpointNetwork, block.Bits(), cursorNetwork, cursorBits) > 0 {
 			copy := checkpoint
@@ -118,7 +185,7 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 		}
 	}
 
-	plan := &Plan{asn: asn, prefixes: ordered, cursor: cursor}
+	plan := &Plan{asn: asn, prefixes: ordered, cursor: cursor, prefixCount: len(unique)}
 	for index := range plan.prefixes {
 		source := &plan.prefixes[index]
 		if cursor == nil || source.start >= cursorNetwork {
@@ -148,7 +215,15 @@ func NewPlanFromBlocks(asn uint32, blocks []Block) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{asn: asn, legacy: ordered}, nil
+	return &Plan{asn: asn, prefixCount: len(seenBlockSources(ordered)), legacy: ordered}, nil
+}
+
+func seenBlockSources(blocks []Block) map[string]struct{} {
+	seen := make(map[string]struct{}, len(blocks))
+	for _, block := range blocks {
+		seen[block.SourcePrefix] = struct{}{}
+	}
+	return seen
 }
 
 func (p *Plan) ASN() uint32 {
@@ -168,6 +243,9 @@ func (p *Plan) PrefixCount() int {
 			seen[block.SourcePrefix] = struct{}{}
 		}
 		return len(seen)
+	}
+	if p.prefixCount > 0 {
+		return p.prefixCount
 	}
 	return len(p.prefixes)
 }

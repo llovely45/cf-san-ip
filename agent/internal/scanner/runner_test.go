@@ -106,7 +106,7 @@ func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"-p 443", "-r 17", "--output-module=csv", "--output-fields=saddr", "--output-filter=success = 1", "8.8.8.0/24"} {
+	for _, argument := range []string{"-p 443", "-r 17", "--cooldown-time=1", "--output-module=csv", "--output-fields=saddr", "--output-filter=success = 1", "8.8.8.0/24"} {
 		if !strings.Contains(string(zmapData), argument) {
 			t.Errorf("ZMap args %q do not contain %q", zmapData, argument)
 		}
@@ -118,7 +118,7 @@ func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"tls", "--port 443", "--senders 23", "--connect-timeout 5s", "--target-timeout 8s", "--blocklist-file", filepath.Join(dir, "blocklist.conf")} {
+	for _, argument := range []string{"tls", "--port 443", "--senders 23", "--connect-timeout 1s", "--target-timeout 1s", "--blocklist-file", filepath.Join(dir, "blocklist.conf")} {
 		if !strings.Contains(string(zgrabData), argument) {
 			t.Errorf("ZGrab2 args %q do not contain %q", zgrabData, argument)
 		}

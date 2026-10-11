@@ -44,13 +44,12 @@ func TestPendingBlocksRejectsPrefixOutsideSourceOrDifferentASN(t *testing.T) {
 	}
 }
 
-func TestCompactPlanStreamsBlocksInAscendingOrderAndHonorsCheckpoints(t *testing.T) {
-	completedCheckpoint := Checkpoint{
+func TestCompactPlanUsesAtMost16BlocksAndMigratesLegacyCheckpoint(t *testing.T) {
+	plan, err := NewPlan(64512, []string{"8.8.0.0/23"}, []Checkpoint{{
 		SourcePrefix: "8.8.0.0/23",
 		BlockCIDR:    "8.8.0.0/24",
 		Status:       "completed",
-	}
-	plan, err := NewPlan(64512, []string{"8.8.0.0/23"}, []Checkpoint{completedCheckpoint})
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,31 +60,88 @@ func TestCompactPlanStreamsBlocksInAscendingOrderAndHonorsCheckpoints(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].BlockCIDR != "8.8.1.0/24" {
-		t.Fatalf("pending blocks = %#v, want only 8.8.1.0/24", got)
+	if len(got) != 1 || got[0].BlockCIDR != "8.8.0.0/23" || got[0].Status != "active" {
+		t.Fatalf("pending blocks = %#v, want the legacy /24 checkpoint's /23 parent rescanned", got)
 	}
 
-	activePlan, err := NewPlan(64512, []string{"8.8.0.0/23"}, []Checkpoint{{
-		SourcePrefix: "8.8.0.0/23",
-		BlockCIDR:    "8.8.0.0/24",
-		Status:       "active",
+	largePlan, err := NewPlan(64512, []string{"8.8.0.0/14"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var large []Block
+	if err := largePlan.ForEachPending(func(block Block) error {
+		large = append(large, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"8.8.0.0/16", "8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"}
+	if len(large) != len(want) {
+		t.Fatalf("/14 plan has %d blocks, want %d: %#v", len(large), len(want), large)
+	}
+	for index, block := range large {
+		if block.BlockCIDR != want[index] {
+			t.Errorf("block %d = %s, want %s", index, block.BlockCIDR, want[index])
+		}
+	}
+}
+
+func TestCompactPlanMigratesLegacyCheckpointIntoContainingSlash16(t *testing.T) {
+	latestIP := "8.9.44.12"
+	plan, err := NewPlan(64512, []string{"8.8.0.0/14"}, []Checkpoint{{
+		SourcePrefix: "8.8.0.0/14",
+		BlockCIDR:    "8.9.44.0/24",
+		Status:       "completed",
+		LatestIP:     &latestIP,
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got = nil
-	if err := activePlan.ForEachPending(func(block Block) error {
+	var got []Block
+	if err := plan.ForEachPending(func(block Block) error {
 		got = append(got, block)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].BlockCIDR != "8.8.0.0/24" || got[1].BlockCIDR != "8.8.1.0/24" {
-		t.Fatalf("active-block resume = %#v, want the active block and its successor", got)
+	want := []string{"8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"}
+	if len(got) != len(want) {
+		t.Fatalf("pending blocks = %#v, want %#v", got, want)
+	}
+	for index, block := range got {
+		if block.BlockCIDR != want[index] {
+			t.Errorf("block %d = %s, want %s", index, block.BlockCIDR, want[index])
+		}
+	}
+	if got[0].Status != "active" || got[0].LatestIP == nil || *got[0].LatestIP != latestIP {
+		t.Fatalf("migrated checkpoint = %#v, want active containing /16 with latest IP retained", got[0])
 	}
 }
 
-func TestCompactPlanDeduplicatesOverlapsUsingMostSpecificSource(t *testing.T) {
+func TestCompactPlanKeepsPrefixesNarrowerThanSlash16Intact(t *testing.T) {
+	plan, err := NewPlan(64512, []string{"8.8.0.0/17", "1.0.0.0/25"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Block
+	if err := plan.ForEachPending(func(block Block) error {
+		got = append(got, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"1.0.0.0/25", "8.8.0.0/17"}
+	if len(got) != len(want) {
+		t.Fatalf("pending blocks = %#v, want %#v", got, want)
+	}
+	for index, block := range got {
+		if block.BlockCIDR != want[index] {
+			t.Errorf("block %d = %s, want %s", index, block.BlockCIDR, want[index])
+		}
+	}
+}
+
+func TestCompactPlanSkipsPrefixesCoveredByBroaderRoutes(t *testing.T) {
 	plan, err := NewPlan(64512, []string{"8.8.0.0/23", "8.8.1.0/24"}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -97,8 +153,8 @@ func TestCompactPlanDeduplicatesOverlapsUsingMostSpecificSource(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].SourcePrefix != "8.8.0.0/23" || got[1].SourcePrefix != "8.8.1.0/24" {
-		t.Fatalf("overlap plan = %#v, want sorted unique blocks with most-specific source", got)
+	if len(got) != 1 || got[0].SourcePrefix != "8.8.0.0/23" || got[0].BlockCIDR != "8.8.0.0/23" {
+		t.Fatalf("overlap plan = %#v, want the broader route scanned once", got)
 	}
 }
 
@@ -120,8 +176,8 @@ func TestCompactPlanResumesAfterGlobalCheckpointAcrossOverlappingPrefixes(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(completedPending) != 0 {
-		t.Fatalf("pending blocks after completed overlap = %#v, want none", completedPending)
+	if len(completedPending) != 1 || completedPending[0].BlockCIDR != "8.8.0.0/23" || completedPending[0].Status != "active" {
+		t.Fatalf("pending blocks after legacy overlap checkpoints = %#v, want one conservative /23 rescan", completedPending)
 	}
 
 	activePlan, err := NewPlan(64512,
@@ -141,15 +197,18 @@ func TestCompactPlanResumesAfterGlobalCheckpointAcrossOverlappingPrefixes(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(activePending) != 1 || activePending[0].SourcePrefix != "8.8.1.0/24" || activePending[0].BlockCIDR != "8.8.1.0/24" {
-		t.Fatalf("pending blocks after active overlap = %#v, want the active specific block only", activePending)
+	if len(activePending) != 1 || activePending[0].SourcePrefix != "8.8.0.0/23" || activePending[0].BlockCIDR != "8.8.0.0/23" {
+		t.Fatalf("pending blocks after active overlap = %#v, want the containing /23 rescanned", activePending)
 	}
 }
 
-func TestCompactPlanResumePreservesSortForMixedBlockSizes(t *testing.T) {
+func TestCompactPlanPrefersExactNewCheckpointOverStaleLegacyCheckpoint(t *testing.T) {
 	plan, err := NewPlan(64512,
-		[]string{"8.8.0.0/24", "8.8.0.0/25", "8.8.0.128/25"},
-		[]Checkpoint{{SourcePrefix: "8.8.0.0/24", BlockCIDR: "8.8.0.0/24", Status: "completed"}},
+		[]string{"8.8.0.0/23", "8.8.1.0/24"},
+		[]Checkpoint{
+			{SourcePrefix: "8.8.0.0/23", BlockCIDR: "8.8.0.0/23", Status: "completed"},
+			{SourcePrefix: "8.8.1.0/24", BlockCIDR: "8.8.1.0/24", Status: "completed"},
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -161,8 +220,8 @@ func TestCompactPlanResumePreservesSortForMixedBlockSizes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].BlockCIDR != "8.8.0.0/25" || got[1].BlockCIDR != "8.8.0.128/25" {
-		t.Fatalf("pending blocks = %#v, want both later /25 blocks in order", got)
+	if len(got) != 0 {
+		t.Fatalf("pending blocks = %#v, want exact completed /23 checkpoint to suppress stale child checkpoint", got)
 	}
 }
 
@@ -193,11 +252,11 @@ func TestCompactPlanStreamsFullAS16509SizedRangeAndResumesWithoutTruncation(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 681_605 {
-		t.Fatalf("CountPending() = %d, want the complete 681605-block range", count)
+	if count != 2_744 {
+		t.Fatalf("CountPending() = %d, want the complete 2744-block range", count)
 	}
 
-	const checkpointIndex = uint64(123_456)
+	const checkpointIndex = uint64(1_234)
 	var checkpoint *Block
 	var position uint64
 	if err := plan.ForEachPending(func(block Block) error {
@@ -265,8 +324,8 @@ func TestCompactPlanCountsLargeRangesWithoutMaterializingBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 1024 {
-		t.Fatalf("CountPending() = %d, want 1024", count)
+	if count != 4 {
+		t.Fatalf("CountPending() = %d, want 4 /16 blocks", count)
 	}
 }
 

@@ -241,6 +241,7 @@ func (r *Runner) runBlockPipeline(
 		"-M", "tcp_synscan",
 		"-p", "443",
 		"-r", strconv.FormatUint(config.Limit, 10),
+		"--cooldown-time=1",
 		"--output-module=csv",
 		"--output-fields=saddr",
 		"--output-filter=success = 1",
@@ -258,8 +259,8 @@ func (r *Runner) runBlockPipeline(
 		"tls",
 		"--senders", strconv.FormatUint(uint64(config.Senders), 10),
 		"--port", "443",
-		"--connect-timeout", "5s",
-		"--target-timeout", "8s",
+		"--connect-timeout", "1s",
+		"--target-timeout", "1s",
 		"--blocklist-file", config.BlocklistPath,
 	}
 	zgrabCommand := newGroupCommand(ctx, r.normalizedConfig().ZGrab2Path, zgrabArgs...)

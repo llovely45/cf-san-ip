@@ -53,7 +53,7 @@ func TestPlanUsesBearerAuthAndRejectsASNOrScopeMismatch(t *testing.T) {
 	}
 }
 
-func TestPlanExpandsCompactPrefixesAndAppliesCheckpoints(t *testing.T) {
+func TestPlanMapsLegacyCheckpointToNewBlockAndRescansIt(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"asn":64512,"prefixes":["8.8.8.0/23"],"checkpoints":[{"sourcePrefix":"8.8.8.0/23","blockCidr":"8.8.8.0/24","status":"completed","latestIp":"8.8.8.200"}]}`)
 	}))
@@ -73,8 +73,39 @@ func TestPlanExpandsCompactPrefixesAndAppliesCheckpoints(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(blocks) != 1 || blocks[0].BlockCIDR != "8.8.9.0/24" || blocks[0].Status != "active" {
-		t.Fatalf("Plan() pending blocks = %#v, want the block after the completed checkpoint", blocks)
+	if len(blocks) != 1 || blocks[0].BlockCIDR != "8.8.8.0/23" || blocks[0].Status != "active" {
+		t.Fatalf("Plan() pending blocks = %#v, want the legacy partial /24 mapped to its /23 and rescanned", blocks)
+	}
+}
+
+func TestPlanPrefersExactCurrentCheckpointOverLegacyCheckpointForSameSource(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"asn":64512,"prefixes":["8.8.0.0/14"],"checkpoints":[{"sourcePrefix":"8.8.0.0/14","blockCidr":"8.8.0.0/24","status":"completed","latestIp":"8.8.0.8"},{"sourcePrefix":"8.8.0.0/14","blockCidr":"8.8.0.0/16","status":"completed","latestIp":"8.8.0.9"}]}`)
+	}))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := client.Plan(context.Background(), 64512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocks []prefix.Block
+	if err := plan.ForEachPending(func(block prefix.Block) error {
+		blocks = append(blocks, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"}
+	if len(blocks) != len(want) {
+		t.Fatalf("Plan() pending blocks = %#v, want %#v", blocks, want)
+	}
+	for index, block := range blocks {
+		if block.BlockCIDR != want[index] {
+			t.Errorf("block %d = %s, want %s", index, block.BlockCIDR, want[index])
+		}
 	}
 }
 

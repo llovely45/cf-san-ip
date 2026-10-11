@@ -115,34 +115,35 @@ export function planIPv4Blocks(
     throw new Error("ASN must be a positive safe integer");
   }
 
-  const blocks = new Map<string, PlannedPrefixBlock & { sourcePrefixLength: number }>();
-
-  for (const rawPrefix of prefixes) {
+  const sources: ParsedPrefix[] = [];
+  for (const rawPrefix of normalizeIPv4Prefixes(prefixes)) {
     const prefix = parsePrefix(rawPrefix);
-    if (prefix === null || !isPublicPrefix(prefix)) {
+    if (prefix === null) {
       continue;
     }
+    const previous = sources.at(-1);
+    if (previous !== undefined && previous.last >= prefix.network) {
+      continue;
+    }
+    sources.push(prefix);
+  }
 
-    const blockPrefixLength = Math.max(prefix.prefixLength, 24);
+  const blocks: PlannedPrefixBlock[] = [];
+
+  for (const prefix of sources) {
+
+    const blockPrefixLength = Math.max(prefix.prefixLength, 16);
     const blockSize = 2 ** (32 - blockPrefixLength);
     const blockCount = 2 ** (blockPrefixLength - prefix.prefixLength);
 
     for (let index = 0; index < blockCount; index += 1) {
       const network = prefix.network + index * blockSize;
       const blockCidr = `${formatIPv4(network)}/${blockPrefixLength}`;
-      const existing = blocks.get(blockCidr);
-      if (existing === undefined || prefix.prefixLength > existing.sourcePrefixLength) {
-        blocks.set(blockCidr, {
-          asn,
-          sourcePrefix: prefix.canonical,
-          blockCidr,
-          sourcePrefixLength: prefix.prefixLength,
-        });
-      }
+      blocks.push({ asn, sourcePrefix: prefix.canonical, blockCidr });
     }
   }
 
-  return [...blocks.values()]
+  return blocks
     .sort((left, right) => {
       const leftPrefix = parsePrefix(left.blockCidr);
       const rightPrefix = parsePrefix(right.blockCidr);
@@ -150,8 +151,7 @@ export function planIPv4Blocks(
         (leftPrefix?.network ?? 0) - (rightPrefix?.network ?? 0) ||
         (leftPrefix?.prefixLength ?? 0) - (rightPrefix?.prefixLength ?? 0)
       );
-    })
-    .map(({ sourcePrefixLength: _sourcePrefixLength, ...block }) => block);
+    });
 }
 
 export function isIPv4ScanBlock(sourcePrefix: string, blockCIDR: string): boolean {
@@ -160,7 +160,8 @@ export function isIPv4ScanBlock(sourcePrefix: string, blockCIDR: string): boolea
   return source !== null && block !== null &&
     source.canonical === sourcePrefix && block.canonical === blockCIDR &&
     isPublicPrefix(source) && isPublicPrefix(block) &&
-    block.prefixLength === Math.max(source.prefixLength, 24) &&
+    (block.prefixLength === Math.max(source.prefixLength, 16) ||
+      block.prefixLength === Math.max(source.prefixLength, 24)) &&
     block.network >= source.network && block.last <= source.last;
 }
 

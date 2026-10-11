@@ -3,14 +3,20 @@ import { describe, expect, it } from "vitest";
 import { isIPv4CIDRWithinCIDR, isIPv4ScanBlock, isIPv4WithinCIDR, normalizeIPv4Prefixes, planIPv4Blocks } from "../../src/shared/ipv4-prefixes";
 
 describe("planIPv4Blocks", () => {
-  it("splits a wider prefix into ascending /24 blocks", () => {
-    expect(planIPv4Blocks(64512, ["8.8.0.0/23"])).toEqual([
-      { asn: 64512, sourcePrefix: "8.8.0.0/23", blockCidr: "8.8.0.0/24" },
-      { asn: 64512, sourcePrefix: "8.8.0.0/23", blockCidr: "8.8.1.0/24" },
-    ]);
+	it("keeps /23 as one block and splits wider ranges into ascending /16 blocks", () => {
+		expect(planIPv4Blocks(64512, ["8.8.0.0/23"])).toEqual([
+			{ asn: 64512, sourcePrefix: "8.8.0.0/23", blockCidr: "8.8.0.0/23" },
+		]);
+		expect(planIPv4Blocks(64512, ["8.8.0.0/14"])).toEqual([
+			{ asn: 64512, sourcePrefix: "8.8.0.0/14", blockCidr: "8.8.0.0/16" },
+			{ asn: 64512, sourcePrefix: "8.8.0.0/14", blockCidr: "8.9.0.0/16" },
+			{ asn: 64512, sourcePrefix: "8.8.0.0/14", blockCidr: "8.10.0.0/16" },
+			{ asn: 64512, sourcePrefix: "8.8.0.0/14", blockCidr: "8.11.0.0/16" },
+		]);
   });
 
   it.each([
+    ["8.8.0.0/17", "8.8.0.0/17"],
     ["8.8.8.0/24", "8.8.8.0/24"],
     ["8.8.8.128/25", "8.8.8.128/25"],
   ])("keeps narrower prefix %s intact", (prefix, blockCidr) => {
@@ -19,13 +25,12 @@ describe("planIPv4Blocks", () => {
     ]);
   });
 
-  it("sorts numerically and deterministically deduplicates overlapping prefixes", () => {
-    expect(
-      planIPv4Blocks(64512, ["8.8.1.0/24", "8.8.0.0/23"]),
-    ).toEqual([
-      { asn: 64512, sourcePrefix: "8.8.0.0/23", blockCidr: "8.8.0.0/24" },
-      { asn: 64512, sourcePrefix: "8.8.1.0/24", blockCidr: "8.8.1.0/24" },
-    ]);
+	it("sorts numerically and removes nested prefixes already covered by broader routes", () => {
+		expect(
+			planIPv4Blocks(64512, ["8.8.1.0/24", "8.8.0.0/23"]),
+		).toEqual([
+			{ asn: 64512, sourcePrefix: "8.8.0.0/23", blockCidr: "8.8.0.0/23" },
+		]);
   });
 
   it.each([
@@ -89,12 +94,14 @@ describe("isIPv4CIDRWithinCIDR", () => {
 
 
 describe("isIPv4ScanBlock", () => {
-  it("accepts only aligned public blocks of the planner's size within the source", () => {
-    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/24")).toBe(true);
+  it("accepts new blocks and legacy /24 reports during agent rollout", () => {
+    expect(isIPv4ScanBlock("8.8.0.0/14", "8.8.0.0/16")).toBe(true);
+    expect(isIPv4ScanBlock("8.8.0.0/14", "8.8.1.0/24")).toBe(true);
+    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/23")).toBe(true);
     expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.1.0/24")).toBe(true);
-    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/23")).toBe(false);
+    expect(isIPv4ScanBlock("8.8.0.0/23", "8.8.0.0/22")).toBe(false);
     expect(isIPv4ScanBlock("8.8.0.0/24", "8.8.0.0/25")).toBe(false);
-    expect(isIPv4ScanBlock("8.8.0.1/23", "8.8.0.0/24")).toBe(false);
+    expect(isIPv4ScanBlock("8.8.0.1/23", "8.8.0.0/16")).toBe(false);
     expect(isIPv4ScanBlock("10.0.0.0/24", "10.0.0.0/24")).toBe(false);
   });
 });

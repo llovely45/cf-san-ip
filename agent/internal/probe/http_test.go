@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -46,5 +47,22 @@ func TestFetchCFTraceUsesOnlyIPTargetAndConventionalPath(t *testing.T) {
 func TestFetchCFTraceRejectsInvalidIP(t *testing.T) {
 	if _, err := FetchCFTrace(context.Background(), "not-an-ip", nil); err == nil {
 		t.Fatal("FetchCFTrace() error = nil for invalid address")
+	}
+}
+
+func TestDefaultTargetHTTPTimeoutsAreOneSecond(t *testing.T) {
+	client := newTargetHTTPClient()
+	if client.Timeout != time.Second {
+		t.Errorf("HTTP client timeout = %s, want %s", client.Timeout, time.Second)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("HTTP transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.TLSHandshakeTimeout != time.Second {
+		t.Errorf("TLS handshake timeout = %s, want %s", transport.TLSHandshakeTimeout, time.Second)
+	}
+	if transport.ResponseHeaderTimeout != time.Second {
+		t.Errorf("response-header timeout = %s, want %s", transport.ResponseHeaderTimeout, time.Second)
 	}
 }

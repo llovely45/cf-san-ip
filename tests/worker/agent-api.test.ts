@@ -73,7 +73,7 @@ describe("agent plan and report API", () => {
     ]);
   });
 
-  it("returns the compact source-prefix plan without materializing every /24 row", async () => {
+  it("returns the compact source-prefix plan without materializing every /16 row", async () => {
     const response = await request(makeRoutes(["8.8.0.0/14"]), `/plan?asn=${asn}`);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -86,7 +86,50 @@ describe("agent plan and report API", () => {
     expect(oldRows?.count).toBe(0);
   });
 
-  it("keeps the complete 681605-block range without materializing block rows", async () => {
+  it("accepts new /16 scan progress while the route remains /14", async () => {
+    const routes = makeRoutes(["8.8.0.0/14"]);
+    const planned = await request(routes, `/plan?asn=${asn}`);
+    expect(planned.status).toBe(200);
+
+    const response = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({
+        sourcePrefix: "8.8.0.0/14",
+        blockCidr: "8.8.0.0/16",
+        latestIp: "8.8.12.34",
+      })),
+    });
+
+    expect(response.status).toBe(200);
+    const checkpoint = await db.prepare(
+      "SELECT block_cidr, latest_ip FROM scan_checkpoints WHERE asn = ?",
+    ).bind(asn).first();
+    expect(checkpoint).toEqual({ block_cidr: "8.8.0.0/16", latest_ip: "8.8.12.34" });
+  });
+
+  it("continues accepting legacy /24 progress during agent rollout", async () => {
+    const routes = makeRoutes(["8.8.0.0/14"]);
+    await request(routes, `/plan?asn=${asn}`);
+
+    const response = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({
+        sourcePrefix: "8.8.0.0/14",
+        blockCidr: "8.8.1.0/24",
+        latestIp: "8.8.1.34",
+      })),
+    });
+
+    expect(response.status).toBe(200);
+    const checkpoint = await db.prepare(
+      "SELECT block_cidr, latest_ip FROM scan_checkpoints WHERE asn = ?",
+    ).bind(asn).first();
+    expect(checkpoint).toEqual({ block_cidr: "8.8.1.0/24", latest_ip: "8.8.1.34" });
+  });
+
+  it("keeps the complete 2744 scan-block plan compact", async () => {
     const prefixes = [
       ...Array.from({ length: 10 }, (_, index) => `${11 + index}.0.0.0/8`),
       ...Array.from({ length: 26 }, (_, index) => `21.${index}.0.0/16`),
@@ -97,9 +140,9 @@ describe("agent plan and report API", () => {
     ];
     const expandedBlockCount = prefixes.reduce((count, cidr) => {
       const prefixLength = Number(cidr.split("/")[1]);
-      return count + 2 ** Math.max(24 - prefixLength, 0);
+      return count + 2 ** Math.max(16 - prefixLength, 0);
     }, 0);
-    expect(expandedBlockCount).toBe(681_605);
+    expect(expandedBlockCount).toBe(2_744);
 
     const response = await request(makeRoutes(prefixes), `/plan?asn=${asn}`);
     expect(response.status).toBe(200);

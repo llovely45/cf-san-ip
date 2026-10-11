@@ -15,6 +15,7 @@ import (
 )
 
 const maxTraceBodyBytes = 64 * 1024
+const targetRequestTimeout = time.Second
 
 type TraceResponse struct {
 	RawResponse string
@@ -79,14 +80,15 @@ func newTargetHTTPClient() *http.Client {
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: (&net.Dialer{
-			Timeout: 5 * time.Second,
+			Timeout: targetRequestTimeout,
 		}).DialContext,
+		TLSHandshakeTimeout: targetRequestTimeout,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: true, // Only used for the explicitly selected public IP target.
 		},
-		ResponseHeaderTimeout: 5 * time.Second,
+		ResponseHeaderTimeout: targetRequestTimeout,
 		DisableKeepAlives:     true,
 	}
-	return &http.Client{Transport: transport, Timeout: 8 * time.Second}
+	return &http.Client{Transport: transport, Timeout: targetRequestTimeout}
 }
