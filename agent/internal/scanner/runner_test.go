@@ -100,12 +100,14 @@ OUTPUT
 `))
 
 	collector := &reportCollector{}
+	var scanLog strings.Builder
 	var active, maxActive atomic.Int32
 	var callsMu sync.Mutex
 	calls := make(map[string]int)
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, HeartbeatInterval: time.Hour},
-		Reporter: collector,
+		Config:    RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, HeartbeatInterval: time.Hour},
+		Reporter:  collector,
+		LogOutput: &scanLog,
 		TraceProbe: func(_ context.Context, ip string) (probe.TraceResponse, error) {
 			n := active.Add(1)
 			for previous := maxActive.Load(); n > previous && !maxActive.CompareAndSwap(previous, n); previous = maxActive.Load() {
@@ -135,10 +137,13 @@ OUTPUT
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"--rate 17", "--wait 1", "-p 443", "--interactive", "--nostatus", "8.8.8.0/24"} {
+	for _, argument := range []string{"--rate 17", "--wait 1", "-p 443", "--interactive", "8.8.8.0/24"} {
 		if !strings.Contains(string(args), argument) {
 			t.Errorf("Masscan args %q do not contain %q", args, argument)
 		}
+	}
+	if strings.Contains(string(args), "--nostatus") {
+		t.Errorf("Masscan args %q must allow status output", args)
 	}
 	for _, removed := range []string{"--output-flush", "-oL", "zmap", "zgrab2"} {
 		if strings.Contains(strings.ToLower(string(args)), removed) {
@@ -166,6 +171,11 @@ OUTPUT
 	}
 	if validCandidates != 1 || reports[0].Status != "active" || reports[len(reports)-1].Status != "completed" {
 		t.Fatalf("reports = %#v, want active, one valid candidate, completed", reports)
+	}
+	for _, want := range []string{"scanning block 8.8.8.0/24", "completed block 8.8.8.0/24"} {
+		if !strings.Contains(scanLog.String(), want) {
+			t.Errorf("scan log %q does not contain %q", scanLog.String(), want)
+		}
 	}
 }
 

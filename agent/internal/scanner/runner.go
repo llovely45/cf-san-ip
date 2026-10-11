@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -37,6 +38,7 @@ type Runner struct {
 	Config     RunnerConfig
 	Reporter   Reporter
 	TraceProbe TraceProber
+	LogOutput  io.Writer
 }
 
 func (r *Runner) normalizedConfig() RunnerConfig {
@@ -121,6 +123,7 @@ func (r *Runner) runBlock(
 	if err := r.reportWithRetry(parent, progress); err != nil {
 		return fmt.Errorf("cannot mark scan block active: %w", err)
 	}
+	r.logf("ASN %d: scanning block %s (source %s) at %d PPS\n", asn, block.BlockCIDR, block.SourcePrefix, config.Limit)
 
 	blockCtx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -199,6 +202,7 @@ func (r *Runner) runBlock(
 	default:
 	}
 	if err := parent.Err(); err != nil {
+		r.logf("ASN %d: block %s interrupted: %v\n", asn, block.BlockCIDR, err)
 		return err
 	}
 	if scanErr != nil {
@@ -210,7 +214,16 @@ func (r *Runner) runBlock(
 	if err := r.reportWithRetry(parent, progress); err != nil {
 		return fmt.Errorf("cannot mark scan block completed: %w", err)
 	}
+	r.logf("ASN %d: completed block %s (source %s)\n", asn, block.BlockCIDR, block.SourcePrefix)
 	return nil
+}
+
+func (r *Runner) logf(format string, arguments ...any) {
+	output := r.LogOutput
+	if output == nil {
+		output = os.Stderr
+	}
+	_, _ = fmt.Fprintf(output, format, arguments...)
 }
 
 func (r *Runner) runBlockPipeline(
@@ -228,7 +241,6 @@ func (r *Runner) runBlockPipeline(
 		"--rate", strconv.FormatUint(config.Limit, 10),
 		"--wait", "1",
 		"--interactive",
-		"--nostatus",
 		block.BlockCIDR,
 	}
 	command := newGroupCommand(scanCtx, r.normalizedConfig().MasscanPath, args...)
