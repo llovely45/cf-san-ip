@@ -1,0 +1,43 @@
+diff --git a/ratelimit/ratelimit.go b/ratelimit/ratelimit.go
+index 46c994f..f28168e 100644
+--- a/ratelimit/ratelimit.go
++++ b/ratelimit/ratelimit.go
+@@ -35,5 +35,4 @@ func (l *PerObjectRateLimiter[K]) WaitOrCreate(ctx context.Context, key K, rateL
+-		l.limitLRU.Add(key, rate.NewLimiter(rateLimit, burstRate)) // ensure limiter exists for the key
+-		limiter, ok = l.limitLRU.Get(key)
+-		if !ok {
+-			panic("unexpected error: rate limiter for key not found after adding it")
+-		}
++		// Use the limiter we just created rather than reading it back: the
++		// cache entry can expire (or be evicted) before a second Get.
++		limiter = rate.NewLimiter(rateLimit, burstRate)
++		l.limitLRU.Add(key, limiter)
+diff --git a/ratelimit/ratelimit_test.go b/ratelimit/ratelimit_test.go
+new file mode 100644
+index 0000000..6e56274
+--- /dev/null
++++ b/ratelimit/ratelimit_test.go
+@@ -0,0 +1,23 @@
++package ratelimit
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"golang.org/x/time/rate"
++)
++
++// TestWaitOrCreateEntryExpiresImmediately covers a new limiter whose cache
++// entry has already expired by the time WaitOrCreate uses it. In production
++// this happens when the goroutine stalls for longer than the cache TTL (GC,
++// CPU starvation, VM pause) between creating the limiter and using it; a tiny
++// TTL makes the same window deterministic.
++func TestWaitOrCreateEntryExpiresImmediately(t *testing.T) {
++	l := NewPerObjectRateLimiter[int](100, time.Microsecond)
++	for i := 0; i < 1000; i++ {
++		if err := l.WaitOrCreate(context.Background(), i, rate.Inf, 1); err != nil {
++			t.Fatalf("WaitOrCreate(%d): %v", i, err)
++		}
++	}
++}

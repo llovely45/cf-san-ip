@@ -89,13 +89,20 @@ jobs:
           CGO_ENABLED: 0
           GOARCH: ${{ matrix.arch }}
           GOOS: linux
+          ZGRAB2_COMMIT: ea734bcf60ef2921684cb522dfb87a07a322afa6
         run: |
           set -eu
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           mkdir -p "$work/out"
           go build -trimpath -ldflags='-s -w' -o "$work/out/cf-san" ./cmd/cf-san
-          git clone --depth 1 --branch v1.0.0 https://github.com/zmap/zgrab2.git "$work/zgrab2-src"
+          git init "$work/zgrab2-src"
+          git -C "$work/zgrab2-src" remote add origin https://github.com/zmap/zgrab2.git
+          git -C "$work/zgrab2-src" fetch --depth 1 origin "$ZGRAB2_COMMIT"
+          git -C "$work/zgrab2-src" checkout --detach FETCH_HEAD
+          test "$(git -C "$work/zgrab2-src" rev-parse HEAD)" = "$ZGRAB2_COMMIT"
+          git -C "$work/zgrab2-src" apply --unidiff-zero "$GITHUB_WORKSPACE/agent/patches/zgrab2-rate-limiter-expiration.patch"
+          (cd "$work/zgrab2-src" && env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test ./ratelimit)
           (cd "$work/zgrab2-src/cmd/zgrab2" && go build -trimpath -ldflags='-s -w' -o "$work/out/zgrab2" .)
           test -x "$work/out/zgrab2"
           # Cross-compiled binaries cannot run on the amd64 GitHub runner.
