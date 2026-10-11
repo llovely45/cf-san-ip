@@ -10,13 +10,14 @@ INSTALLER="$SCRIPT_DIR/install.sh"
 SOURCE_FIXTURE_DIR=${CF_SAN_FIXTURE_DIR:-"$REPOSITORY_ROOT/test-fixtures"}
 [ -x "$SOURCE_FIXTURE_DIR/cf-san" ] || { echo "missing Linux cf-san fixture: $SOURCE_FIXTURE_DIR/cf-san" >&2; exit 1; }
 [ -x "$SOURCE_FIXTURE_DIR/zgrab2" ] || { echo "missing zgrab2 fixture" >&2; exit 1; }
+[ -s "$SOURCE_FIXTURE_DIR/zgrab2-blocklist.conf" ] || { echo "missing ZGrab2 blocklist fixture" >&2; exit 1; }
 
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' 0
 FIXTURE_DIR="$TEMP_DIR/release"
 STUB_DIR="$TEMP_DIR/bin"
 mkdir -p "$STUB_DIR" "$FIXTURE_DIR"
-cp "$SOURCE_FIXTURE_DIR/cf-san" "$SOURCE_FIXTURE_DIR/zgrab2" "$SOURCE_FIXTURE_DIR/THIRD_PARTY_NOTICES.txt" "$FIXTURE_DIR/"
+cp "$SOURCE_FIXTURE_DIR/cf-san" "$SOURCE_FIXTURE_DIR/zgrab2" "$SOURCE_FIXTURE_DIR/zgrab2-blocklist.conf" "$SOURCE_FIXTURE_DIR/THIRD_PARTY_NOTICES.txt" "$FIXTURE_DIR/"
 PACKAGE_LOG="$TEMP_DIR/package-manager.log"
 CURL_LOG="$TEMP_DIR/curl.log"
 export PACKAGE_LOG CURL_LOG CF_SAN_FIXTURE_DIR="$FIXTURE_DIR"
@@ -74,7 +75,7 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   export MOCK_ARCH=$mock_arch
   archive="$FIXTURE_DIR/cf-san_linux_${release_arch}.tar.gz"
   checksum="$archive.sha256"
-  tar -czf "$archive" -C "$FIXTURE_DIR" cf-san zgrab2 THIRD_PARTY_NOTICES.txt
+  tar -czf "$archive" -C "$FIXTURE_DIR" cf-san zgrab2 zgrab2-blocklist.conf THIRD_PARTY_NOTICES.txt
   sha256sum "$archive" > "$checksum"
   : > "$PACKAGE_LOG"
   : > "$CURL_LOG"
@@ -86,6 +87,8 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   case "$install_output" in *installer-test-secret*) echo 'installer echoed token' >&2; exit 1 ;; esac
   [ -x /usr/local/bin/cf-san ] || { echo 'cf-san was not installed' >&2; exit 1; }
   [ -x /usr/local/bin/zgrab2 ] || { echo 'zgrab2 was not installed' >&2; exit 1; }
+  [ -s /etc/cf-san/zgrab2-blocklist.conf ] || { echo 'ZGrab2 blocklist was not installed' >&2; exit 1; }
+  [ -s /usr/local/share/cf-san/zgrab2-blocklist.conf ] || { echo 'packaged ZGrab2 blocklist was not installed' >&2; exit 1; }
   [ "$(stat -c '%a' /etc/cf-san/config.json)" = 600 ] || { echo 'config permissions are not 0600' >&2; exit 1; }
   grep -q 'installer-test-secret' /etc/cf-san/config.json || { echo 'agent config omitted token' >&2; exit 1; }
   grep -q "cf-san_linux_${release_arch}.tar.gz" "$CURL_LOG" || { echo "installer selected the wrong release architecture ($release_arch)" >&2; exit 1; }
@@ -96,6 +99,7 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   esac
 
   /usr/local/bin/cf-san configure --url 'https://worker.example' --token 'old-token' --asn 16509 --limit 250 --senders 40
+  printf 'custom-range\n' > /etc/cf-san/zgrab2-blocklist.conf
   : > "$PACKAGE_LOG"
   update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
     CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
@@ -109,9 +113,10 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   grep -q '"asn": 16509' /etc/cf-san/config.json || { echo 'update did not preserve ASN' >&2; exit 1; }
   grep -q '"limit": 250' /etc/cf-san/config.json || { echo 'update did not preserve ZMap rate' >&2; exit 1; }
   grep -q '"senders": 40' /etc/cf-san/config.json || { echo 'update did not preserve ZGrab2 concurrency' >&2; exit 1; }
+  grep -q '^custom-range$' /etc/cf-san/zgrab2-blocklist.conf || { echo 'update replaced the existing ZGrab2 blocklist' >&2; exit 1; }
 
   rm -f /usr/local/bin/cf-san /usr/local/bin/zgrab2 /etc/cf-san/config.json
-  rm -rf /etc/cf-san
+  rm -rf /etc/cf-san /usr/local/share/cf-san
   printf 'installer %s/%s install passed\n' "${ID:-linux}" "$release_arch"
 done
 
@@ -125,7 +130,8 @@ grep -q 'unsupported CPU architecture' "$TEMP_DIR/unsupported.out" || { cat "$TE
 mkdir -p "$TEMP_DIR/bad-checksum"
 cp "$FIXTURE_DIR/cf-san" "$FIXTURE_DIR/zgrab2" "$FIXTURE_DIR/THIRD_PARTY_NOTICES.txt" "$TEMP_DIR/bad-checksum/"
 archive="$TEMP_DIR/bad-checksum/cf-san_linux_amd64.tar.gz"
-tar -czf "$archive" -C "$TEMP_DIR/bad-checksum" cf-san zgrab2 THIRD_PARTY_NOTICES.txt
+cp "$SOURCE_FIXTURE_DIR/zgrab2-blocklist.conf" "$TEMP_DIR/bad-checksum/"
+tar -czf "$archive" -C "$TEMP_DIR/bad-checksum" cf-san zgrab2 zgrab2-blocklist.conf THIRD_PARTY_NOTICES.txt
 printf '%064d  %s\n' 0 "$archive" > "$archive.sha256"
 CF_SAN_FIXTURE_DIR="$TEMP_DIR/bad-checksum" CF_SAN_RELEASE_REPOSITORY='example/cf-san' \
   PATH="$STUB_DIR:$PATH" MOCK_ARCH=x86_64 \

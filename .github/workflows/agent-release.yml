@@ -57,6 +57,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$fixture/cf-san" ./cmd/cf-san
           printf '#!/bin/sh\nexit 0\n' > "$fixture/zgrab2"
           chmod 0755 "$fixture/zgrab2"
+          cp config/zgrab2-blocklist.conf "$fixture/zgrab2-blocklist.conf"
           printf 'test fixture license notice\n' > "$fixture/THIRD_PARTY_NOTICES.txt"
       - name: Exercise installer in ${{ matrix.image }}
         env:
@@ -117,8 +118,9 @@ jobs:
             "$work/out/zgrab2" tls --help >/dev/null 2>&1
           fi
           cp "$work/zgrab2-src/LICENSE" "$work/out/THIRD_PARTY_NOTICES.txt"
+          cp config/zgrab2-blocklist.conf "$work/out/zgrab2-blocklist.conf"
           archive="cf-san_linux_${GOARCH}.tar.gz"
-          tar -C "$work/out" -czf "$archive" cf-san zgrab2 THIRD_PARTY_NOTICES.txt
+          tar -C "$work/out" -czf "$archive" cf-san zgrab2 zgrab2-blocklist.conf THIRD_PARTY_NOTICES.txt
           sha256sum "$archive" > "$archive.sha256"
           mkdir -p release-assets
           mv "$archive" "$archive.sha256" release-assets/

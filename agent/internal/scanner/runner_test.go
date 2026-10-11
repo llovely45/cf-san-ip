@@ -41,6 +41,15 @@ func makeExecutable(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+func testBlocklist(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "blocklist.conf")
+	if err := os.WriteFile(path, []byte("192.0.2.0/24\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func baseBlock(cidr string) prefix.Block {
 	return prefix.Block{ASN: 64512, SourcePrefix: "8.8.8.0/23", BlockCIDR: cidr, Status: "active"}
 }
@@ -72,7 +81,7 @@ func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) 
 	collector := &reportCollector{}
 	var probed []string
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), Limit: 17, Senders: 23, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 17, Senders: 23, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(_ context.Context, ip string) (probe.TraceResponse, error) {
 			probed = append(probed, ip)
@@ -97,16 +106,19 @@ func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"-p 443", "-r 17", "--output-fields=saddr", "--output-filter=success = 1", "8.8.8.0/24"} {
+	for _, argument := range []string{"-p 443", "-r 17", "--output-module=csv", "--output-fields=saddr", "--output-filter=success = 1", "8.8.8.0/24"} {
 		if !strings.Contains(string(zmapData), argument) {
 			t.Errorf("ZMap args %q do not contain %q", zmapData, argument)
 		}
+	}
+	if strings.Contains(string(zmapData), "--no-header-row") {
+		t.Fatalf("ZMap args contain an unsupported option: %q", zmapData)
 	}
 	zgrabData, err := os.ReadFile(zgrabArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"tls", "--port 443", "--senders 23", "--connect-timeout 5s", "--target-timeout 8s"} {
+	for _, argument := range []string{"tls", "--port 443", "--senders 23", "--connect-timeout 5s", "--target-timeout 8s", "--blocklist-file", filepath.Join(dir, "blocklist.conf")} {
 		if !strings.Contains(string(zgrabData), argument) {
 			t.Errorf("ZGrab2 args %q do not contain %q", zgrabData, argument)
 		}
@@ -128,7 +140,7 @@ func TestRunScansBlocksInAscendingOrderAndSkipsCompletedBlocks(t *testing.T) {
 	makeExecutable(t, dir, "zgrab2", `cat >/dev/null`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			t.Fatal("no probe expected")
@@ -162,7 +174,7 @@ func TestHeartbeatReportsActiveBlockDuringLongScan(t *testing.T) {
 	makeExecutable(t, dir, "zgrab2", `while IFS= read -r ip; do printf '{"ip":"%s","data":{"tls":{"status":"failure"}}}\n' "$ip"; sleep 0.18; done`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), Limit: 100, Senders: 10, HeartbeatInterval: 20 * time.Millisecond},
+		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: 20 * time.Millisecond},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			t.Fatal("TLS failure must not probe HTTPS")
@@ -200,7 +212,7 @@ func TestCancellationLeavesActiveBlockIncomplete(t *testing.T) {
 	makeExecutable(t, dir, "zgrab2", `cat >/dev/null`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:     RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
+		Config:     RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
 		Reporter:   collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) { return probe.TraceResponse{}, nil },
 	}
@@ -227,5 +239,18 @@ func TestCancellationLeavesActiveBlockIncomplete(t *testing.T) {
 		if report.Status == "completed" {
 			t.Fatal("cancelled scan marked its active block complete")
 		}
+	}
+}
+
+func TestValidateBlocklistFileRejectsMissingAndEmptyFiles(t *testing.T) {
+	if err := ValidateBlocklistFile(filepath.Join(t.TempDir(), "missing.conf")); err == nil {
+		t.Fatal("ValidateBlocklistFile accepted a missing blocklist")
+	}
+	empty := filepath.Join(t.TempDir(), "empty.conf")
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateBlocklistFile(empty); err == nil {
+		t.Fatal("ValidateBlocklistFile accepted an empty blocklist")
 	}
 }

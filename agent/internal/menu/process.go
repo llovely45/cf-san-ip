@@ -40,6 +40,17 @@ func NewManager() Manager {
 	return Manager{Executable: executable, Arguments: []string{"run"}, RunDir: runDir, LogDir: logDir}
 }
 
+func (m Manager) LogPath() string {
+	dir := m.LogDir
+	if dir == "" {
+		dir = os.Getenv("CF_SAN_LOG_DIR")
+	}
+	if dir == "" {
+		dir = "/var/log/cf-san"
+	}
+	return filepath.Join(dir, "agent.log")
+}
+
 func (m Manager) pidPath() string {
 	dir := m.RunDir
 	if dir == "" {

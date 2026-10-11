@@ -171,10 +171,11 @@ func runScan(cfg config.Config, configPath string) error {
 	defer manager.RemoveIfCurrent(pid)
 	runner := scanner.Runner{
 		Config: scanner.RunnerConfig{
-			ZMapPath:   "zmap",
-			ZGrab2Path: "zgrab2",
-			Limit:      cfg.Limit,
-			Senders:    cfg.Senders,
+			ZMapPath:      "zmap",
+			ZGrab2Path:    "zgrab2",
+			BlocklistPath: scanner.DefaultBlocklistPath,
+			Limit:         cfg.Limit,
+			Senders:       cfg.Senders,
 		},
 		Reporter: client,
 	}

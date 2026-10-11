@@ -29,6 +29,7 @@ type TraceProber func(context.Context, string) (probe.TraceResponse, error)
 type RunnerConfig struct {
 	ZMapPath          string
 	ZGrab2Path        string
+	BlocklistPath     string
 	Limit             uint64
 	Senders           uint32
 	HeartbeatInterval time.Duration
@@ -56,6 +57,9 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 	}
 	if config.ZGrab2Path == "" {
 		config.ZGrab2Path = "zgrab2"
+	}
+	if config.BlocklistPath == "" {
+		config.BlocklistPath = DefaultBlocklistPath
 	}
 	if config.Limit == 0 {
 		config.Limit = 100
@@ -112,6 +116,9 @@ func (r *Runner) validateRun() (RunnerConfig, error) {
 	config := r.normalizedConfig()
 	if config.Limit == 0 || config.Senders == 0 {
 		return RunnerConfig{}, errors.New("ZMap rate and ZGrab2 sender count must be positive")
+	}
+	if err := ValidateBlocklistFile(config.BlocklistPath); err != nil {
+		return RunnerConfig{}, err
 	}
 	return config, nil
 }
@@ -234,8 +241,8 @@ func (r *Runner) runBlockPipeline(
 		"-M", "tcp_synscan",
 		"-p", "443",
 		"-r", strconv.FormatUint(config.Limit, 10),
+		"--output-module=csv",
 		"--output-fields=saddr",
-		"--no-header-row",
 		"--output-filter=success = 1",
 		"-o", "-",
 		block.BlockCIDR,
@@ -253,6 +260,7 @@ func (r *Runner) runBlockPipeline(
 		"--port", "443",
 		"--connect-timeout", "5s",
 		"--target-timeout", "8s",
+		"--blocklist-file", config.BlocklistPath,
 	}
 	zgrabCommand := newGroupCommand(ctx, r.normalizedConfig().ZGrab2Path, zgrabArgs...)
 	zgrabCommand.Stdin = zmapOutput

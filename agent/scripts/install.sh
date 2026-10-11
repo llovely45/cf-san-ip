@@ -97,8 +97,15 @@ ACTUAL_SHA=$(sha256sum "${TEMP_DIR}/${ARCHIVE}" | awk '{ print $1 }')
 tar -xzf "${TEMP_DIR}/${ARCHIVE}" -C "$TEMP_DIR"
 [ -x "${TEMP_DIR}/cf-san" ] || fail 'release archive does not contain cf-san'
 [ -x "${TEMP_DIR}/zgrab2" ] || fail 'release archive does not contain zgrab2'
+[ -s "${TEMP_DIR}/zgrab2-blocklist.conf" ] || fail 'release archive does not contain a non-empty ZGrab2 blocklist'
 install -m 0755 "${TEMP_DIR}/cf-san" /usr/local/bin/cf-san
 install -m 0755 "${TEMP_DIR}/zgrab2" /usr/local/bin/zgrab2
+install -d -m 0755 /usr/local/share/cf-san
+install -m 0644 "${TEMP_DIR}/zgrab2-blocklist.conf" /usr/local/share/cf-san/zgrab2-blocklist.conf
+install -d -m 0755 /etc/cf-san
+if [ ! -s /etc/cf-san/zgrab2-blocklist.conf ]; then
+  install -m 0644 "${TEMP_DIR}/zgrab2-blocklist.conf" /etc/cf-san/zgrab2-blocklist.conf
+fi
 if [ -f "${TEMP_DIR}/THIRD_PARTY_NOTICES.txt" ]; then
   install -m 0644 "${TEMP_DIR}/THIRD_PARTY_NOTICES.txt" /usr/local/share/cf-san-THIRD_PARTY_NOTICES.txt
 fi

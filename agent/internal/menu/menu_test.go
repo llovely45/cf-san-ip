@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,11 +31,11 @@ func TestMenuShowsConfigurationAndUpdateChoices(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	app := &App{ConfigPath: path, Input: strings.NewReader("11\n"), Output: &output}
+	app := &App{ConfigPath: path, Input: strings.NewReader("12\n"), Output: &output}
 	if err := app.Run(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"8. 修改后端地址", "9. 修改 API Token", "10. 更新 cf-san 和 ZGrab2 到最新版本", "11. 退出"} {
+	for _, want := range []string{"8. 修改后端地址", "9. 修改 API Token", "10. 更新 cf-san 和 ZGrab2 到最新版本", "11. 查看扫描日志", "12. 退出"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("menu output missing %q: %s", want, output.String())
 		}
@@ -50,7 +51,7 @@ func TestMenuUpdateChoiceRunsUpdaterAndPersistsConfig(t *testing.T) {
 	var called bool
 	app := &App{
 		ConfigPath: path,
-		Input:      strings.NewReader("10\n11\n"),
+		Input:      strings.NewReader("10\n12\n"),
 		Output:     &bytes.Buffer{},
 		updateAgent: func(_ context.Context, cfg config.Config, _ io.Writer) error {
 			called = true
@@ -125,7 +126,7 @@ func TestMenuCanChangeBackendURLAndToken(t *testing.T) {
 	var output bytes.Buffer
 	app := &App{
 		ConfigPath: path,
-		Input:      strings.NewReader("8\nhttps://new-worker.example/\n9\nnew-token\n7\n11\n"),
+		Input:      strings.NewReader("8\nhttps://new-worker.example/\n9\nnew-token\n7\n12\n"),
 		Output:     &output,
 	}
 	if err := app.Run(); err != nil {
@@ -140,5 +141,117 @@ func TestMenuCanChangeBackendURLAndToken(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Token：new-token") {
 		t.Fatalf("updated token was not displayed by status: %s", output.String())
+	}
+}
+
+func TestMenuDisplaysRecentLogsBeforeExit(t *testing.T) {
+	dir := t.TempDir()
+	manager := &Manager{RunDir: filepath.Join(dir, "run"), LogDir: filepath.Join(dir, "log")}
+	if err := os.MkdirAll(manager.LogDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(manager.LogDir, "agent.log")
+	if err := os.WriteFile(logPath, []byte("old line\nlatest scanner error\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := config.Save(path, config.Config{URL: "https://worker.example", Token: "token", Limit: 100, Senders: 10, AgentID: "id"}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	app := &App{
+		ConfigPath: path,
+		Manager:    manager,
+		Input:      strings.NewReader("11\n12\n"),
+		Output:     &output,
+	}
+	if err := app.Run(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"11. 查看扫描日志", "12. 退出", "old line", "latest scanner error", logPath} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("menu output missing %q: %s", want, output.String())
+		}
+	}
+}
+
+func TestLogTailShowsOnlyLastRequestedLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	if err := os.WriteFile(path, []byte("one\ntwo\nthree\nfour\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readLogTail(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "three\nfour\n" {
+		t.Fatalf("readLogTail() = %q, want last two lines", got)
+	}
+}
+
+func TestEnsureZGrab2BlocklistInstallsDefaultAndPreservesExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "packaged", "blocklist.conf")
+	target := filepath.Join(dir, "etc", "cf-san", "zgrab2-blocklist.conf")
+	if err := os.MkdirAll(filepath.Dir(source), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("192.0.2.0/24\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	copied, err := ensureZGrab2Blocklist(source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copied {
+		t.Fatal("ensureZGrab2Blocklist() did not report installing the default file")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "192.0.2.0/24\n" {
+		t.Fatalf("installed blocklist = %q", got)
+	}
+	if err := os.WriteFile(target, []byte("custom\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	copied, err = ensureZGrab2Blocklist(source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied {
+		t.Fatal("ensureZGrab2Blocklist() replaced an existing custom file")
+	}
+	got, err = os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "custom\n" {
+		t.Fatalf("existing blocklist was modified: %q", got)
+	}
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	copied, err = ensureZGrab2Blocklist(source, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copied {
+		t.Fatal("ensureZGrab2Blocklist() did not replace an empty file")
+	}
+	got, err = os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "192.0.2.0/24\n" {
+		t.Fatalf("repaired blocklist = %q", got)
+	}
+}
+
+func TestEnsureZGrab2BlocklistReportsMissingBundledSource(t *testing.T) {
+	_, err := ensureZGrab2Blocklist(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "target"))
+	if err == nil {
+		t.Fatal("ensureZGrab2Blocklist() accepted a missing bundled source")
 	}
 }

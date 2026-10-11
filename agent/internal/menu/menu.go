@@ -14,6 +14,7 @@ import (
 
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
+	"cf-san/internal/scanner"
 )
 
 type App struct {
@@ -74,7 +75,8 @@ func (app *App) Run() error {
 		fmt.Fprintln(app.Output, "8. 修改后端地址")
 		fmt.Fprintln(app.Output, "9. 修改 API Token")
 		fmt.Fprintln(app.Output, "10. 更新 cf-san 和 ZGrab2 到最新版本")
-		fmt.Fprintln(app.Output, "11. 退出")
+		fmt.Fprintln(app.Output, "11. 查看扫描日志（最近 100 行）")
+		fmt.Fprintln(app.Output, "12. 退出")
 		choice, err := readLine(reader, app.Output, "请选择：")
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -112,11 +114,36 @@ func (app *App) Run() error {
 				fmt.Fprintln(app.Output, "更新完成；请退出菜单后重新运行 cf-san，以加载新版本。")
 			}
 		case "11":
+			app.showLogs()
+		case "12":
 			return nil
 		default:
-			fmt.Fprintln(app.Output, "无效选项，请输入 1–11。")
+			fmt.Fprintln(app.Output, "无效选项，请输入 1–12。")
 		}
 	}
+}
+
+func (app *App) showLogs() {
+	path := app.manager().LogPath()
+	fmt.Fprintf(app.Output, "扫描日志（最近 100 行）：%s\n", path)
+	data, err := readLogTail(path, 100)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintln(app.Output, "日志文件尚不存在；请先启动扫描。")
+			return
+		}
+		fmt.Fprintf(app.Output, "读取日志失败：%v\n", err)
+		return
+	}
+	if len(data) == 0 {
+		fmt.Fprintln(app.Output, "日志文件为空。")
+		return
+	}
+	fmt.Fprint(app.Output, string(data))
+	if data[len(data)-1] != '\n' {
+		fmt.Fprintln(app.Output)
+	}
+	fmt.Fprintln(app.Output, "实时跟踪日志：sudo tail -f "+path)
 }
 
 func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
@@ -155,6 +182,16 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if _, err := exec.LookPath("zgrab2"); err != nil {
 		return errors.New("未找到 zgrab2；请检查安装")
 	}
+	copied, err := ensureZGrab2Blocklist(
+		"/usr/local/share/cf-san/zgrab2-blocklist.conf",
+		scanner.DefaultBlocklistPath,
+	)
+	if err != nil {
+		return fmt.Errorf("ZGrab2 屏蔽名单初始化失败：%w", err)
+	}
+	if copied {
+		fmt.Fprintln(app.Output, "已安装 ZGrab2 默认屏蔽名单。")
+	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
 	}
@@ -173,6 +210,9 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 func (app *App) start(cfg *config.Config) error {
 	if err := config.ValidateForScan(*cfg); err != nil {
 		return err
+	}
+	if err := scanner.ValidateBlocklistFile(scanner.DefaultBlocklistPath); err != nil {
+		return fmt.Errorf("ZGrab2 屏蔽名单未初始化，请先选择菜单 1：%w", err)
 	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err

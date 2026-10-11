@@ -133,7 +133,7 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body []by
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return nil, errors.New("backend request failed")
+		return nil, fmt.Errorf("backend request failed: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

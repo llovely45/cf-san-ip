@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -177,5 +178,30 @@ func TestReportSendsCandidateJSONToAuthenticatedEndpoint(t *testing.T) {
 	}
 	if received.Candidate == nil || received.Candidate.IP != candidate.IP || received.Status != "active" {
 		t.Fatalf("received report = %#v", received)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestPlanPreservesBackendTransportErrorForLogs(t *testing.T) {
+	want := errors.New("synthetic connection timeout")
+	client, err := newClient("https://worker.example", "token", &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, want
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Plan(context.Background(), 64512)
+	if !errors.Is(err, want) {
+		t.Fatalf("Plan() error = %v, want wrapped transport error", err)
+	}
+	if !strings.Contains(err.Error(), "backend request failed") || !strings.Contains(err.Error(), want.Error()) {
+		t.Fatalf("Plan() error = %v, want operation and transport details", err)
 	}
 }

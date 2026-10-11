@@ -21,7 +21,7 @@ The tag workflow runs the full Worker, UI, Go, migration, and installer checks. 
 - `cf-san_linux_amd64.tar.gz` and its `.sha256` file
 - `cf-san_linux_arm64.tar.gz` and its `.sha256` file
 
-Each archive contains the Go agent, the pinned ZGrab2 v1.0.0 binary, and its third-party license notice. ZMap is installed from the Debian/Alpine package manager on the target host. The installer checks the archive SHA-256 before installing either binary.
+Each archive contains the Go agent, the pinned ZGrab2 v1.0.0 binary, its upstream IPv4/IPv6 special-purpose-address blocklist, and the third-party license notice. ZMap is installed from the Debian/Alpine package manager on the target host. The installer checks the archive SHA-256 before installing the binaries and blocklist.
 
 ## Linux installation and menu
 
@@ -29,7 +29,7 @@ The generated command is intended for a Debian or Alpine Linux host with outboun
 
 Run `sudo cf-san` to open the text menu. It supports:
 
-1. Initialize/check ZMap, ZGrab2, backend authentication, ASN, and the current scan plan.
+1. Initialize/check ZMap and ZGrab2, install the bundled blocklist if missing, and check backend authentication, ASN, and the current scan plan.
 2. Start a one-pass scan in the background.
 3. Pause the scan with SIGTERM; the active block remains incomplete.
 4. Set ZMap rate in packets per second.
@@ -39,9 +39,10 @@ Run `sudo cf-san` to open the text menu. It supports:
 8. Change the backend HTTPS address.
 9. Change the API token.
 10. After pausing any active scan, fetch the current installer script from the configured Worker and use it to install the latest GitHub Release of `cf-san` and bundled ZGrab2. This mode skips OS package installation and preserves the saved scan settings.
-11. Exit. After updating, exit and run `sudo cf-san` again to load the new binary.
+11. Display the latest 100 lines from `/var/log/cf-san/agent.log`; use the shown `tail -f` command for live following.
+12. Exit. After updating, exit and run `sudo cf-san` again to load the new binary.
 
-Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san`. The first version does not install a boot-time service.
+Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. The bundled ZGrab2 special-purpose-address blocklist is installed at `/etc/cf-san/zgrab2-blocklist.conf` unless an existing custom file is present. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san/agent.log`. The first version does not install a boot-time service.
 
 CLI settings override saved values, for example:
 
