@@ -34,10 +34,11 @@ type Report struct {
 }
 
 type planResponse struct {
-	ASN         uint32              `json:"asn"`
-	Prefixes    []string            `json:"prefixes"`
-	Checkpoints []prefix.Checkpoint `json:"checkpoints"`
-	Blocks      []prefix.Block      `json:"blocks"`
+	ASN              uint32              `json:"asn"`
+	Prefixes         []string            `json:"prefixes"`
+	Checkpoints      []prefix.Checkpoint `json:"checkpoints"`
+	BlockCheckpoints []prefix.Checkpoint `json:"blockCheckpoints"`
+	Blocks           []prefix.Block      `json:"blocks"`
 }
 
 type Client struct {
@@ -91,7 +92,9 @@ func (c *Client) Plan(ctx context.Context, asn uint32) (*prefix.Plan, error) {
 		return nil, errors.New("backend scan plan ASN does not match the requested ASN")
 	}
 	if len(response.Prefixes) > 0 {
-		plan, err := prefix.NewPlan(asn, response.Prefixes, response.Checkpoints)
+		plan, err := prefix.NewPlanWithBlockProgress(
+			asn, response.Prefixes, response.Checkpoints, response.BlockCheckpoints,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("backend scan plan is invalid: %w", err)
 		}

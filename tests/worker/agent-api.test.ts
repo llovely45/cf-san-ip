@@ -43,13 +43,14 @@ const report = (overrides: Record<string, unknown> = {}) => ({
 describe("agent plan and report API", () => {
   beforeEach(async () => {
     await db.prepare("DELETE FROM scan_blocks").run();
+    await db.prepare("DELETE FROM scan_block_progress").run();
     await db.prepare("DELETE FROM scan_checkpoints").run();
     await db.prepare("DELETE FROM scan_plan_snapshots").run();
     await db.prepare("DELETE FROM ip_records").run();
     await new D1SettingsRepository(db).setApiToken("agent-test-token");
   });
 
-  it("returns compact source prefixes and preserves checkpoints across plan refreshes", async () => {
+  it("returns compact source prefixes and preserves per-block progress across plan refreshes", async () => {
     const routes = makeRoutes(["8.8.9.0/24", "8.8.8.0/23"]);
     const first = await request(routes, `/plan?asn=${asn}`);
     expect(first.status).toBe(200);
@@ -57,6 +58,7 @@ describe("agent plan and report API", () => {
       asn,
       prefixes: ["8.8.8.0/23", "8.8.9.0/24"],
       checkpoints: [],
+      blockCheckpoints: [],
     });
 
     const completed = await request(
@@ -66,9 +68,10 @@ describe("agent plan and report API", () => {
     );
     expect(completed.status).toBe(200);
     const second = await request(makeRoutes(["8.8.8.0/23", "8.8.9.0/24"]), `/plan?asn=${asn}`);
-    const secondBody = await second.json() as { prefixes: string[]; checkpoints: Array<{ blockCidr: string; status: string }> };
+    const secondBody = await second.json() as { prefixes: string[]; checkpoints: Array<{ blockCidr: string; status: string }>; blockCheckpoints: Array<{ blockCidr: string; status: string }> };
     expect(secondBody.prefixes).toEqual(["8.8.8.0/23", "8.8.9.0/24"]);
-    expect(secondBody.checkpoints).toEqual([
+    expect(secondBody.checkpoints).toEqual([]);
+    expect(secondBody.blockCheckpoints).toEqual([
       { sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/24", status: "completed", latestIp: null },
     ]);
   });
@@ -80,6 +83,7 @@ describe("agent plan and report API", () => {
       asn,
       prefixes: ["8.8.0.0/14"],
       checkpoints: [],
+      blockCheckpoints: [],
     });
     const oldRows = await db.prepare("SELECT COUNT(*) AS count FROM scan_blocks WHERE asn = ?")
       .bind(asn).first<{ count: number }>();
@@ -103,9 +107,35 @@ describe("agent plan and report API", () => {
 
     expect(response.status).toBe(200);
     const checkpoint = await db.prepare(
-      "SELECT block_cidr, latest_ip FROM scan_checkpoints WHERE asn = ?",
+      "SELECT block_cidr, latest_ip FROM scan_block_progress WHERE asn = ?",
     ).bind(asn).first();
     expect(checkpoint).toEqual({ block_cidr: "8.8.0.0/16", latest_ip: "8.8.12.34" });
+  });
+
+  it("stores and returns concurrent block progress independently within one source prefix", async () => {
+    const routes = makeRoutes(["8.8.0.0/14"]);
+    await request(routes, `/plan?asn=${asn}`);
+
+    for (const block of [
+      { blockCidr: "8.8.0.0/16", status: "active" },
+      { blockCidr: "8.9.0.0/16", status: "completed" },
+      { blockCidr: "8.10.0.0/16", status: "active" },
+    ]) {
+      const response = await request(routes, "/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(report({ sourcePrefix: "8.8.0.0/14", ...block })),
+      });
+      expect(response.status).toBe(200);
+    }
+
+    const response = await request(makeRoutes(["8.8.0.0/14"]), `/plan?asn=${asn}`);
+    const body = await response.json() as { blockCheckpoints: Array<{ sourcePrefix: string; blockCidr: string; status: string }> };
+    expect(body.blockCheckpoints.sort((left, right) => left.blockCidr.localeCompare(right.blockCidr))).toEqual([
+        { sourcePrefix: "8.8.0.0/14", blockCidr: "8.8.0.0/16", status: "active", latestIp: null },
+        { sourcePrefix: "8.8.0.0/14", blockCidr: "8.9.0.0/16", status: "completed", latestIp: null },
+        { sourcePrefix: "8.8.0.0/14", blockCidr: "8.10.0.0/16", status: "active", latestIp: null },
+    ].sort((left, right) => left.blockCidr.localeCompare(right.blockCidr)));
   });
 
   it("continues accepting legacy /24 progress during agent rollout", async () => {
@@ -124,7 +154,7 @@ describe("agent plan and report API", () => {
 
     expect(response.status).toBe(200);
     const checkpoint = await db.prepare(
-      "SELECT block_cidr, latest_ip FROM scan_checkpoints WHERE asn = ?",
+      "SELECT block_cidr, latest_ip FROM scan_block_progress WHERE asn = ?",
     ).bind(asn).first();
     expect(checkpoint).toEqual({ block_cidr: "8.8.1.0/24", latest_ip: "8.8.1.34" });
   });
@@ -198,10 +228,14 @@ describe("agent plan and report API", () => {
       asn,
       prefixes: ["8.8.7.0/24", "8.8.8.0/24", "8.8.9.0/24"],
       checkpoints: [],
+      blockCheckpoints: [],
     });
     const checkpoints = await db.prepare("SELECT source_prefix FROM scan_checkpoints WHERE asn = ?")
       .bind(asn).all<{ source_prefix: string }>();
     expect(checkpoints.results).toEqual([]);
+    const blockProgress = await db.prepare("SELECT source_prefix FROM scan_block_progress WHERE asn = ?")
+      .bind(asn).all<{ source_prefix: string }>();
+    expect(blockProgress.results).toEqual([]);
   });
 
   it("does not regress a completed checkpoint when a stale active report arrives", async () => {
@@ -218,7 +252,7 @@ describe("agent plan and report API", () => {
       body: JSON.stringify(report({ status: "active", latestIp: "8.8.8.7" })),
     });
     expect(stale.status).toBe(200);
-    expect(await db.prepare("SELECT status FROM scan_checkpoints WHERE asn = ?")
+    expect(await db.prepare("SELECT status FROM scan_block_progress WHERE asn = ?")
       .bind(asn).first()).toMatchObject({ status: "completed" });
   });
 
@@ -315,6 +349,6 @@ describe("agent plan and report API", () => {
     });
     expect(response.status).toBe(200);
     expect(await db.prepare("SELECT * FROM ip_records").all()).toMatchObject({ results: [] });
-    expect(await db.prepare("SELECT latest_ip FROM scan_checkpoints WHERE asn = ?").bind(asn).first()).toMatchObject({ latest_ip: "8.8.8.7" });
+    expect(await db.prepare("SELECT latest_ip FROM scan_block_progress WHERE asn = ?").bind(asn).first()).toMatchObject({ latest_ip: "8.8.8.7" });
   });
 });

@@ -31,8 +31,12 @@ type RunnerConfig struct {
 	CurlPath          string
 	Limit             uint64
 	CurlWorkers       uint32
+	BlockWorkers      uint32
 	HeartbeatInterval time.Duration
 }
+
+// MaxConcurrentBlocks is the default upper bound for concurrent Masscan blocks.
+const MaxConcurrentBlocks uint32 = 4
 
 type Runner struct {
 	Config     RunnerConfig
@@ -55,6 +59,9 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 	if config.CurlWorkers == 0 {
 		config.CurlWorkers = 100
 	}
+	if config.BlockWorkers == 0 || config.BlockWorkers > MaxConcurrentBlocks {
+		config.BlockWorkers = MaxConcurrentBlocks
+	}
 	if config.HeartbeatInterval <= 0 {
 		config.HeartbeatInterval = 10 * time.Minute
 	}
@@ -70,15 +77,7 @@ func (r *Runner) Run(ctx context.Context, asn uint32, blocks []prefix.Block) err
 	if err != nil {
 		return err
 	}
-	for _, block := range pending {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := r.runBlock(ctx, asn, block, config); err != nil {
-			return err
-		}
-	}
-	return nil
+	return r.runBlocks(ctx, asn, pending, config)
 }
 
 func (r *Runner) RunPlan(ctx context.Context, plan *prefix.Plan) error {
@@ -89,12 +88,25 @@ func (r *Runner) RunPlan(ctx context.Context, plan *prefix.Plan) error {
 	if err != nil {
 		return err
 	}
-	return plan.ForEachPending(func(block prefix.Block) error {
+	batchSize := r.blockConcurrency(config)
+	batch := make([]prefix.Block, 0, batchSize)
+	if err := plan.ForEachPending(func(block prefix.Block) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return r.runBlock(ctx, plan.ASN(), block, config)
-	})
+		batch = append(batch, block)
+		if len(batch) < batchSize {
+			return nil
+		}
+		if err := r.runBlockBatch(ctx, plan.ASN(), batch, config); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}); err != nil {
+		return err
+	}
+	return r.runBlockBatch(ctx, plan.ASN(), batch, config)
 }
 
 func (r *Runner) validateRun() (RunnerConfig, error) {
@@ -111,19 +123,106 @@ func (r *Runner) validateRun() (RunnerConfig, error) {
 	return config, nil
 }
 
+func (r *Runner) blockConcurrency(config RunnerConfig) int {
+	workers := config.BlockWorkers
+	if workers > config.CurlWorkers {
+		workers = config.CurlWorkers
+	}
+	if uint64(workers) > config.Limit {
+		workers = uint32(config.Limit)
+	}
+	if workers == 0 {
+		return 1
+	}
+	return int(workers)
+}
+
+func (r *Runner) runBlocks(ctx context.Context, asn uint32, blocks []prefix.Block, config RunnerConfig) error {
+	batchSize := r.blockConcurrency(config)
+	for start := 0; start < len(blocks); start += batchSize {
+		end := min(start+batchSize, len(blocks))
+		if err := r.runBlockBatch(ctx, asn, blocks[start:end], config); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func (r *Runner) runBlockBatch(
+	parent context.Context,
+	asn uint32,
+	blocks []prefix.Block,
+	config RunnerConfig,
+) error {
+	if len(blocks) == 0 {
+		return parent.Err()
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	batchCtx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	errorsFound := make(chan error, len(blocks))
+	var workers sync.WaitGroup
+	for index, block := range blocks {
+		blockConfig := config
+		blockConfig.Limit = splitLimit(config.Limit, len(blocks), index)
+		blockConfig.CurlWorkers = uint32(splitLimit(uint64(config.CurlWorkers), len(blocks), index))
+		workers.Add(1)
+		go func(index int, block prefix.Block, blockConfig RunnerConfig) {
+			defer workers.Done()
+			if err := r.runBlock(batchCtx, asn, block, blockConfig, index+1, len(blocks), config.Limit); err != nil {
+				select {
+				case errorsFound <- err:
+				default:
+				}
+				cancel()
+			}
+		}(index, block, blockConfig)
+	}
+	workers.Wait()
+	if err := parent.Err(); err != nil {
+		return err
+	}
+	select {
+	case err := <-errorsFound:
+		return err
+	default:
+		return nil
+	}
+}
+
+func splitLimit(total uint64, parts, index int) uint64 {
+	base := total / uint64(parts)
+	if uint64(index) < total%uint64(parts) {
+		base++
+	}
+	return base
+}
+
 func (r *Runner) runBlock(
 	parent context.Context,
 	asn uint32,
 	block prefix.Block,
 	config RunnerConfig,
+	workerIndex int,
+	workerCount int,
+	aggregateLimit uint64,
 ) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	progress := backend.Report{
 		ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR, Status: "active",
 	}
 	if err := r.reportWithRetry(parent, progress); err != nil {
 		return fmt.Errorf("cannot mark scan block active: %w", err)
 	}
-	r.logf("ASN %d: scanning block %s (source %s) at %d PPS\n", asn, block.BlockCIDR, block.SourcePrefix, config.Limit)
+	r.logf(
+		"ASN %d: scanning block %s (source %s) at %d PPS; block worker %d/%d, aggregate cap %d PPS\n",
+		asn, block.BlockCIDR, block.SourcePrefix, config.Limit, workerIndex, workerCount, aggregateLimit,
+	)
 
 	blockCtx, cancel := context.WithCancel(parent)
 	defer cancel()

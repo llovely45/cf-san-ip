@@ -109,6 +109,37 @@ func TestPlanPrefersExactCurrentCheckpointOverLegacyCheckpointForSameSource(t *t
 	}
 }
 
+func TestPlanResumesEachConcurrentBlockWithoutSkippingEarlierActiveWork(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"asn":64512,"prefixes":["8.8.0.0/14"],"checkpoints":[],"blockCheckpoints":[{"sourcePrefix":"8.8.0.0/14","blockCidr":"8.8.0.0/16","status":"active"},{"sourcePrefix":"8.8.0.0/14","blockCidr":"8.9.0.0/16","status":"completed"}]}`)
+	}))
+	defer server.Close()
+	client, err := newClient(server.URL, "token", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := client.Plan(context.Background(), 64512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []prefix.Block
+	if err := plan.ForEachPending(func(block prefix.Block) error {
+		got = append(got, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"8.8.0.0/16", "8.10.0.0/16", "8.11.0.0/16"}
+	if len(got) != len(want) {
+		t.Fatalf("pending blocks = %#v, want active and unscanned blocks only", got)
+	}
+	for index, cidr := range want {
+		if got[index].BlockCIDR != cidr {
+			t.Errorf("pending block %d = %s, want %s", index, got[index].BlockCIDR, cidr)
+		}
+	}
+}
+
 func TestPlanAcceptsTensOfThousandsOfPrefixesAndCheckpoints(t *testing.T) {
 	prefixes := make([]string, 19_152)
 	checkpoints := make([]prefix.Checkpoint, len(prefixes))
@@ -122,9 +153,10 @@ func TestPlanAcceptsTensOfThousandsOfPrefixesAndCheckpoints(t *testing.T) {
 		}
 	}
 	body, err := json.Marshal(map[string]any{
-		"asn":         64512,
-		"prefixes":    prefixes,
-		"checkpoints": checkpoints,
+		"asn":              64512,
+		"prefixes":         prefixes,
+		"checkpoints":      checkpoints,
+		"blockCheckpoints": checkpoints,
 	})
 	if err != nil {
 		t.Fatal(err)

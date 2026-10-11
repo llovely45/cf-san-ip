@@ -93,7 +93,7 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	urlValue := flags.String("url", "", "HTTPS Worker base URL")
 	tokenValue := flags.String("token", "", "API Bearer token")
 	asnValue := flags.Uint("asn", 0, "AS number")
-	limitValue := flags.Uint64("limit", 0, "Masscan packets per second")
+	limitValue := flags.Uint64("limit", 0, "Aggregate Masscan packets-per-second cap")
 	workersValue := flags.Uint("workers", 0, "Concurrent curl validations")
 	sendersValue := flags.Uint("senders", 0, "Deprecated alias for --workers")
 	configPath := flags.String("config", "", "local configuration path")
@@ -176,7 +176,11 @@ func runScan(cfg config.Config, configPath string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stdout, "ASN %d: %d current source prefixes; scanning pending blocks in ascending order\n", cfg.ASN, plan.PrefixCount())
+	fmt.Fprintf(
+		os.Stdout,
+		"ASN %d: %d current source prefixes; scanning pending blocks in ascending batches (up to %d concurrent)\n",
+		cfg.ASN, plan.PrefixCount(), scanner.MaxConcurrentBlocks,
+	)
 	manager := menu.NewManager()
 	pid := os.Getpid()
 	defer manager.RemoveIfCurrent(pid)

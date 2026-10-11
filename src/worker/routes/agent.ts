@@ -63,7 +63,8 @@ export function createAgentRoutes(
     const repository = new D1ScanCheckpointRepository(resolveDb(context));
     await repository.savePlan(asn, prefixes);
     const checkpoints = await repository.list(asn, prefixes);
-    return context.json({ asn, prefixes, checkpoints });
+    const blockCheckpoints = await repository.listBlockProgress(asn, prefixes);
+    return context.json({ asn, prefixes, checkpoints, blockCheckpoints });
   });
 
   routes.post("/report", async (context) => {

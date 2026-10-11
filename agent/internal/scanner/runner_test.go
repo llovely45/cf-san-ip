@@ -105,7 +105,7 @@ OUTPUT
 	var callsMu sync.Mutex
 	calls := make(map[string]int)
 	runner := Runner{
-		Config:    RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, HeartbeatInterval: time.Hour},
+		Config:    RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, BlockWorkers: 1, HeartbeatInterval: time.Hour},
 		Reporter:  collector,
 		LogOutput: &scanLog,
 		TraceProbe: func(_ context.Context, ip string) (probe.TraceResponse, error) {
@@ -186,7 +186,7 @@ func TestRunScansBlocksInAscendingOrderAndSkipsCompletedBlocks(t *testing.T) {
 	masscan := makeExecutable(t, dir, "masscan", `printf '%s\n' "$*" >> "$MASSCAN_ARGS_FILE"`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 10, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 10, BlockWorkers: 1, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			t.Fatal("no open targets expected")
@@ -212,6 +212,103 @@ func TestRunScansBlocksInAscendingOrderAndSkipsCompletedBlocks(t *testing.T) {
 	reports := collector.snapshot()
 	if len(reports) != 4 || reports[0].BlockCIDR != "8.8.8.0/24" || reports[2].BlockCIDR != "8.8.10.0/24" || reports[3].Status != "completed" {
 		t.Fatalf("reports = %#v", reports)
+	}
+}
+
+func TestRunScansFourBlocksConcurrentlyAndSharesConfiguredLimits(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "masscan.args")
+	startedDir := filepath.Join(dir, "started")
+	if err := os.Mkdir(startedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MASSCAN_ARGS_FILE", argsFile)
+	t.Setenv("MASSCAN_STARTED_DIR", startedDir)
+	masscan := makeExecutable(t, dir, "masscan", `
+  printf '%s\n' "$*" >> "$MASSCAN_ARGS_FILE"
+  last=""
+  for argument do last="$argument"; done
+  case "$last" in
+    8.8.0.0/24) prefix=8.8.0 ;;
+    8.8.1.0/24) prefix=8.8.1 ;;
+    8.8.2.0/24) prefix=8.8.2 ;;
+    8.8.3.0/24) prefix=8.8.3 ;;
+    *) exit 8 ;;
+  esac
+  marker=$(printf '%s' "$last" | tr '/.' '__')
+  touch "$MASSCAN_STARTED_DIR/$marker.started"
+  attempt=0
+  while :; do
+    count=$(find "$MASSCAN_STARTED_DIR" -type f -name '*.started' | wc -l | tr -d ' ')
+    [ "$count" -ge 4 ] && break
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 300 ] || exit 9
+    sleep 0.01
+  done
+  for host in 1 2 3 4; do
+    printf 'Discovered open port 443/tcp on %s.%s\n' "$prefix" "$host"
+  done
+`)
+	collector := &reportCollector{}
+	var active, maxActive atomic.Int32
+	var validations atomic.Int32
+	runner := Runner{
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 8, BlockWorkers: 4, HeartbeatInterval: time.Hour},
+		Reporter: collector,
+		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
+			n := active.Add(1)
+			for previous := maxActive.Load(); n > previous && !maxActive.CompareAndSwap(previous, n); previous = maxActive.Load() {
+			}
+			time.Sleep(20 * time.Millisecond)
+			active.Add(-1)
+			validations.Add(1)
+			return response("cloudflare", "loc=US\n"), nil
+		},
+	}
+	blocks := []prefix.Block{
+		{ASN: 64512, SourcePrefix: "8.8.0.0/24", BlockCIDR: "8.8.0.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.1.0/24", BlockCIDR: "8.8.1.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.2.0/24", BlockCIDR: "8.8.2.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.3.0/24", BlockCIDR: "8.8.3.0/24", Status: "active"},
+	}
+	if err := runner.Run(context.Background(), 64512, blocks); err != nil {
+		t.Fatal(err)
+	}
+
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("Masscan invocations = %d, want 4: %q", len(lines), lines)
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, "--rate 25") {
+			t.Errorf("Masscan args %q do not use one quarter of the 100 PPS aggregate cap", line)
+		}
+	}
+
+	statuses := make(map[string]map[string]bool)
+	for _, report := range collector.snapshot() {
+		if statuses[report.BlockCIDR] == nil {
+			statuses[report.BlockCIDR] = make(map[string]bool)
+		}
+		statuses[report.BlockCIDR][report.Status] = true
+	}
+	if len(statuses) != 4 {
+		t.Fatalf("reported blocks = %#v, want all 4 concurrent blocks", statuses)
+	}
+	for _, block := range blocks {
+		if !statuses[block.BlockCIDR]["active"] || !statuses[block.BlockCIDR]["completed"] {
+			t.Errorf("block %s reports = %#v, want active and completed", block.BlockCIDR, statuses[block.BlockCIDR])
+		}
+	}
+	if got := validations.Load(); got != 16 {
+		t.Errorf("curl validations = %d, want 16 discovered open targets", got)
+	}
+	if got := maxActive.Load(); got > 8 {
+		t.Errorf("maximum concurrent curl validations = %d, want no more than configured global limit 8", got)
 	}
 }
 

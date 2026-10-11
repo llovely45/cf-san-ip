@@ -14,6 +14,7 @@ import (
 
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
+	"cf-san/internal/scanner"
 )
 
 type App struct {
@@ -237,7 +238,7 @@ func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice s
 	key, prompt := "", ""
 	switch choice {
 	case "4":
-		key, prompt = "limit", "新的 Masscan 发包速率（PPS）："
+		key, prompt = "limit", "新的 Masscan 总发包速率上限（PPS）："
 	case "5":
 		key, prompt = "workers", "新的 curl 验证并发数："
 	case "6":
@@ -272,8 +273,8 @@ func (app *App) printStatus(cfg config.Config) {
 	if cfg.Token != "" {
 		tokenState = cfg.Token
 	}
-	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nMasscan PPS 上限：%d\ncurl 验证并发：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
-		cfg.URL, cfg.ASN, cfg.Limit, cfg.CurlWorkers, tokenState, cfg.AgentID, state)
+	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nMasscan PPS 上限：%d\ncurl 验证并发：%d\n并发扫描块上限：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
+		cfg.URL, cfg.ASN, cfg.Limit, cfg.CurlWorkers, scanner.MaxConcurrentBlocks, tokenState, cfg.AgentID, state)
 }
 
 func UpdateSetting(cfg *config.Config, key, raw string) error {
@@ -288,7 +289,7 @@ func UpdateSetting(cfg *config.Config, key, raw string) error {
 	case "limit":
 		parsed, err := strconv.ParseUint(value, 10, 64)
 		if err != nil || parsed == 0 || parsed > math.MaxInt64 {
-			return errors.New("Masscan 发包速率必须是大于零的整数")
+			return errors.New("Masscan 总发包速率上限必须是大于零的整数")
 		}
 		cfg.Limit = parsed
 	case "workers":

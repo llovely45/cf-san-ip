@@ -26,14 +26,28 @@ type planPrefix struct {
 // Plan keeps source prefixes and sparse checkpoints, not one object per /16.
 // Large ASNs therefore have bounded plan memory regardless of their block count.
 type Plan struct {
-	asn         uint32
-	prefixCount int
-	prefixes    []planPrefix
-	cursor      *Checkpoint
-	legacy      []Block
+	asn           uint32
+	prefixCount   int
+	prefixes      []planPrefix
+	cursor        *Checkpoint
+	blockProgress map[string]Checkpoint
+	legacy        []Block
 }
 
 func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, error) {
+	return newPlan(asn, prefixes, checkpoints, nil)
+}
+
+func NewPlanWithBlockProgress(
+	asn uint32,
+	prefixes []string,
+	checkpoints []Checkpoint,
+	blockProgress []Checkpoint,
+) (*Plan, error) {
+	return newPlan(asn, prefixes, checkpoints, blockProgress)
+}
+
+func newPlan(asn uint32, prefixes []string, checkpoints, blockProgress []Checkpoint) (*Plan, error) {
 	if asn == 0 {
 		return nil, fmt.Errorf("ASN must be positive")
 	}
@@ -185,7 +199,70 @@ func NewPlan(asn uint32, prefixes []string, checkpoints []Checkpoint) (*Plan, er
 		}
 	}
 
-	plan := &Plan{asn: asn, prefixes: ordered, cursor: cursor, prefixCount: len(unique)}
+	legacyBlockProgress := make(map[string]Checkpoint, len(blockProgress))
+	exactBlockProgress := make(map[string]Checkpoint, len(blockProgress))
+	seenBlockProgress := make(map[checkpointKey]struct{}, len(blockProgress))
+	for _, checkpoint := range blockProgress {
+		source, exists := unique[checkpoint.SourcePrefix]
+		if !exists {
+			return nil, fmt.Errorf("block progress references a source prefix outside the current plan")
+		}
+		key := checkpointKey{source: checkpoint.SourcePrefix, block: checkpoint.BlockCIDR}
+		if _, duplicate := seenBlockProgress[key]; duplicate {
+			return nil, fmt.Errorf("plan contains duplicate per-block progress")
+		}
+		seenBlockProgress[key] = struct{}{}
+
+		block, err := validateBlock(Block{
+			SourcePrefix: checkpoint.SourcePrefix,
+			BlockCIDR:    checkpoint.BlockCIDR,
+			Status:       checkpoint.Status,
+		})
+		if err != nil {
+			return nil, err
+		}
+		legacyBlockBit := max(source.prefix.Bits(), 24)
+		if block.Bits() != source.blockBit && block.Bits() != legacyBlockBit {
+			return nil, fmt.Errorf("block progress contains an invalid scan block")
+		}
+		if checkpoint.LatestIP != nil {
+			address, parseErr := netip.ParseAddr(*checkpoint.LatestIP)
+			if parseErr != nil || !address.Is4() || !block.Contains(address) {
+				return nil, fmt.Errorf("block progress contains an invalid latest IP")
+			}
+		}
+
+		ownerName := ownerBySource[checkpoint.SourcePrefix]
+		owner := ownerByPrefix[ownerName]
+		newBlock := netip.PrefixFrom(block.Addr(), owner.blockBit).Masked()
+		mapped := Checkpoint{
+			SourcePrefix: owner.source,
+			BlockCIDR:    newBlock.String(),
+			Status:       "active",
+			LatestIP:     checkpoint.LatestIP,
+		}
+		isExact := checkpoint.SourcePrefix == owner.source &&
+			checkpoint.BlockCIDR == mapped.BlockCIDR && block.Bits() == owner.blockBit
+		if isExact {
+			mapped.Status = checkpoint.Status
+			exactBlockProgress[mapped.BlockCIDR] = mapped
+		} else if previous, ok := legacyBlockProgress[mapped.BlockCIDR]; !ok || (previous.LatestIP == nil && mapped.LatestIP != nil) {
+			legacyBlockProgress[mapped.BlockCIDR] = mapped
+		}
+	}
+
+	perBlock := make(map[string]Checkpoint, len(legacyBlockProgress)+len(exactBlockProgress))
+	for blockCIDR, checkpoint := range legacyBlockProgress {
+		perBlock[blockCIDR] = checkpoint
+	}
+	for blockCIDR, checkpoint := range exactBlockProgress {
+		perBlock[blockCIDR] = checkpoint
+	}
+
+	plan := &Plan{
+		asn: asn, prefixes: ordered, cursor: cursor,
+		blockProgress: perBlock, prefixCount: len(unique),
+	}
 	for index := range plan.prefixes {
 		source := &plan.prefixes[index]
 		if cursor == nil || source.start >= cursorNetwork {
@@ -292,6 +369,19 @@ func (p *Plan) ForEachPending(visit func(Block) error) error {
 			SourcePrefix: first.source,
 			BlockCIDR:    formatIPv4Block(first.network, first.blockBit),
 			Status:       "active",
+		}
+		if progress, exists := p.blockProgress[block.BlockCIDR]; exists {
+			if progress.SourcePrefix != block.SourcePrefix {
+				return fmt.Errorf("block progress does not match the current plan's block ownership")
+			}
+			if progress.Status == "completed" {
+				continue
+			}
+			block.LatestIP = progress.LatestIP
+			if err := visit(block); err != nil {
+				return err
+			}
+			continue
 		}
 		if p.cursor != nil {
 			cursorBlock, _ := netip.ParsePrefix(p.cursor.BlockCIDR)

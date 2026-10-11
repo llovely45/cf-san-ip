@@ -329,6 +329,33 @@ func TestCompactPlanCountsLargeRangesWithoutMaterializingBlocks(t *testing.T) {
 	}
 }
 
+func TestPlanWithBlockProgressResumesConcurrentBlocksIndependently(t *testing.T) {
+	plan, err := NewPlanWithBlockProgress(64512, []string{"8.8.0.0/14"}, nil, []Checkpoint{
+		{SourcePrefix: "8.8.0.0/14", BlockCIDR: "8.8.0.0/16", Status: "active"},
+		{SourcePrefix: "8.8.0.0/14", BlockCIDR: "8.9.0.0/16", Status: "completed"},
+		{SourcePrefix: "8.8.0.0/14", BlockCIDR: "8.10.0.0/16", Status: "completed"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Block
+	if err := plan.ForEachPending(func(block Block) error {
+		got = append(got, block)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"8.8.0.0/16", "8.11.0.0/16"}
+	if len(got) != len(want) {
+		t.Fatalf("pending blocks = %#v, want active first block and unscanned final block", got)
+	}
+	for index, cidr := range want {
+		if got[index].BlockCIDR != cidr {
+			t.Errorf("pending block %d = %s, want %s", index, got[index].BlockCIDR, cidr)
+		}
+	}
+}
+
 func TestCompactPlanRejectsInvalidCheckpoints(t *testing.T) {
 	_, err := NewPlan(64512, []string{"8.8.0.0/23"}, []Checkpoint{{
 		SourcePrefix: "8.8.0.0/23",

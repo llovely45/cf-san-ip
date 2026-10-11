@@ -32,10 +32,11 @@ export class D1ScanCheckpointRepository {
     ).bind(asn).first<{ prefixes_json: string }>();
     const statements: D1PreparedStatement[] = [];
     if (previous !== null && !samePrefixSet(previous.prefixes_json, prefixes)) {
-      // A changed route set may add blocks before the saved cursor. Reset only
-      // the compact progress so the new full plan cannot skip those blocks.
+      // A changed route set may add blocks before saved progress. Reset both
+      // the legacy cursor and per-block progress so new routes cannot be skipped.
       statements.push(
         this.db.prepare("DELETE FROM scan_checkpoints WHERE asn = ?").bind(asn),
+        this.db.prepare("DELETE FROM scan_block_progress WHERE asn = ?").bind(asn),
       );
     }
     statements.push(this.db.prepare(
@@ -70,6 +71,27 @@ export class D1ScanCheckpointRepository {
       }));
   }
 
+  async listBlockProgress(asn: number, currentPrefixes: string[]): Promise<ScanCheckpoint[]> {
+    const rows = await this.db.prepare(
+      `SELECT source_prefix, block_cidr, status, latest_ip
+       FROM scan_block_progress
+       WHERE asn = ?`,
+    ).bind(asn).all<ScanCheckpointRow>();
+    const current = new Set(currentPrefixes);
+    return rows.results
+      .filter((row) => current.has(row.source_prefix))
+      .sort((left, right) =>
+        left.source_prefix.localeCompare(right.source_prefix) ||
+        left.block_cidr.localeCompare(right.block_cidr),
+      )
+      .map((row) => ({
+        sourcePrefix: row.source_prefix,
+        blockCidr: row.block_cidr,
+        status: row.status,
+        latestIp: row.latest_ip,
+      }));
+  }
+
   async isInCurrentPlan(asn: number, sourcePrefix: string): Promise<boolean> {
     const result = await this.db.prepare(
       `SELECT 1 AS present
@@ -82,18 +104,12 @@ export class D1ScanCheckpointRepository {
 
   async updateProgress(progress: ScanProgress): Promise<void> {
     await this.db.prepare(
-      `INSERT INTO scan_checkpoints(asn, source_prefix, block_cidr, status, latest_ip)
+      `INSERT INTO scan_block_progress(asn, source_prefix, block_cidr, status, latest_ip)
        VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(asn, source_prefix) DO UPDATE SET
-         latest_ip = CASE
-           WHEN scan_checkpoints.block_cidr = excluded.block_cidr
-             THEN COALESCE(excluded.latest_ip, scan_checkpoints.latest_ip)
-           ELSE excluded.latest_ip
-         END,
-         block_cidr = excluded.block_cidr,
+       ON CONFLICT(asn, source_prefix, block_cidr) DO UPDATE SET
+         latest_ip = COALESCE(excluded.latest_ip, scan_block_progress.latest_ip),
          status = CASE
-           WHEN scan_checkpoints.status = 'completed'
-             AND scan_checkpoints.block_cidr = excluded.block_cidr
+           WHEN scan_block_progress.status = 'completed'
              THEN 'completed'
            ELSE excluded.status
          END,
@@ -125,18 +141,12 @@ export class D1ScanCheckpointRepository {
          region = excluded.region`,
     ).bind(candidate.ip, candidate.port, candidate.asn, candidate.region);
     const progressStatement = this.db.prepare(
-      `INSERT INTO scan_checkpoints(asn, source_prefix, block_cidr, status, latest_ip)
+      `INSERT INTO scan_block_progress(asn, source_prefix, block_cidr, status, latest_ip)
        VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(asn, source_prefix) DO UPDATE SET
-         latest_ip = CASE
-           WHEN scan_checkpoints.block_cidr = excluded.block_cidr
-             THEN COALESCE(excluded.latest_ip, scan_checkpoints.latest_ip)
-           ELSE excluded.latest_ip
-         END,
-         block_cidr = excluded.block_cidr,
+       ON CONFLICT(asn, source_prefix, block_cidr) DO UPDATE SET
+         latest_ip = COALESCE(excluded.latest_ip, scan_block_progress.latest_ip),
          status = CASE
-           WHEN scan_checkpoints.status = 'completed'
-             AND scan_checkpoints.block_cidr = excluded.block_cidr
+           WHEN scan_block_progress.status = 'completed'
              THEN 'completed'
            ELSE excluded.status
          END,

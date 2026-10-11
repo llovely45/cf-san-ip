@@ -96,7 +96,7 @@ func Validate(cfg Config) error {
 		return errors.New("API token is required")
 	}
 	if cfg.Limit == 0 {
-		return errors.New("Masscan rate limit must be greater than zero")
+		return errors.New("aggregate Masscan rate limit must be greater than zero")
 	}
 	if cfg.CurlWorkers == 0 {
 		return errors.New("curl worker count must be greater than zero")

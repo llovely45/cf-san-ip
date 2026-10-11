@@ -23,6 +23,9 @@ func TestPrintStatusDisplaysConfiguredToken(t *testing.T) {
 	if !strings.Contains(output.String(), "Token：visible-token") {
 		t.Fatalf("status output does not display configured token: %q", output.String())
 	}
+	if !strings.Contains(output.String(), "并发扫描块上限：4") {
+		t.Fatalf("status output does not display the four-block concurrency limit: %q", output.String())
+	}
 }
 
 func TestMenuShowsConfigurationAndUpdateChoices(t *testing.T) {
