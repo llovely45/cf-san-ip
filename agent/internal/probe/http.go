@@ -1,94 +1,112 @@
 package probe
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"net/netip"
-	"net/url"
+	"os/exec"
 	"strings"
-	"time"
 )
-
-const maxTraceBodyBytes = 64 * 1024
-const targetRequestTimeout = time.Second
 
 type TraceResponse struct {
 	RawResponse string
 	Body        string
 }
 
-func FetchCFTrace(ctx context.Context, ip string, client *http.Client) (TraceResponse, error) {
+const maxTraceBodyBytes = 64 * 1024
+const maxTraceResponseBytes = 80 * 1024
+
+// FetchCFTrace invokes curl for the selected public IP. Curl performs the TLS
+// handshake and the HTTP request together, so no separate TLS scanner is needed.
+func FetchCFTrace(ctx context.Context, ip, curlPath string) (TraceResponse, error) {
 	address, err := netip.ParseAddr(ip)
 	if err != nil || !address.Is4() {
 		return TraceResponse{}, errors.New("trace target must be an IPv4 address")
 	}
-	if client == nil {
-		client = newTargetHTTPClient()
+	if curlPath == "" {
+		curlPath = "curl"
 	}
-	safeClient := *client
-	safeClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	target := &url.URL{
-		Scheme: "https",
-		Host:   net.JoinHostPort(address.String(), "443"),
-		Path:   "/cdn-cgi/trace",
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	target := fmt.Sprintf("https://%s:443/cdn-cgi/trace", address.String())
+	command := exec.CommandContext(ctx, curlPath,
+		"--silent",
+		"--show-error",
+		"--insecure",
+		"--include",
+		"--connect-timeout", "1",
+		"--max-time", "1",
+		"--max-filesize", fmt.Sprint(maxTraceBodyBytes),
+		target,
+	)
+	command.Stderr = io.Discard
+	stdout, err := command.StdoutPipe()
 	if err != nil {
-		return TraceResponse{}, errors.New("cannot create Cloudflare trace request")
+		return TraceResponse{}, errors.New("cannot capture curl response")
 	}
-	request.Header.Set("User-Agent", "cf-san-agent/1")
-	response, err := safeClient.Do(request)
-	if err != nil {
-		return TraceResponse{}, errors.New("Cloudflare trace request failed")
+	if err := command.Start(); err != nil {
+		return TraceResponse{}, errors.New("cannot start curl; verify it is installed")
 	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxTraceBodyBytes+1))
-	if err != nil {
-		return TraceResponse{}, errors.New("cannot read Cloudflare trace response")
+	var response limitedResponseBuffer
+	response.limit = maxTraceResponseBytes
+	_, copyErr := io.Copy(&response, stdout)
+	waitErr := command.Wait()
+	if ctx.Err() != nil {
+		return TraceResponse{}, ctx.Err()
+	}
+	if copyErr != nil {
+		return TraceResponse{}, errors.New("cannot read curl response")
+	}
+	if response.exceeded {
+		return TraceResponse{}, errors.New("curl response exceeds size limit")
+	}
+	if waitErr != nil {
+		return TraceResponse{}, errors.New("curl trace request failed")
+	}
+	raw := response.buffer.String()
+	body, ok := responseBody(raw)
+	if !ok {
+		return TraceResponse{}, errors.New("curl response has no HTTP headers")
 	}
 	if len(body) > maxTraceBodyBytes {
 		return TraceResponse{}, errors.New("Cloudflare trace response exceeds size limit")
 	}
-
-	status := response.Status
-	if status == "" {
-		status = fmt.Sprintf("%d %s", response.StatusCode, http.StatusText(response.StatusCode))
-	}
-	var raw strings.Builder
-	raw.WriteString(response.Proto)
-	raw.WriteByte(' ')
-	raw.WriteString(status)
-	raw.WriteString("\r\n")
-	if err := response.Header.Write(&raw); err != nil {
-		return TraceResponse{}, errors.New("cannot serialize Cloudflare trace response")
-	}
-	raw.WriteString("\r\n")
-	raw.Write(body)
-	return TraceResponse{RawResponse: raw.String(), Body: string(body)}, nil
+	return TraceResponse{RawResponse: raw, Body: body}, nil
 }
 
-func newTargetHTTPClient() *http.Client {
-	transport := &http.Transport{
-		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout: targetRequestTimeout,
-		}).DialContext,
-		TLSHandshakeTimeout: targetRequestTimeout,
-		TLSClientConfig: &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, // Only used for the explicitly selected public IP target.
-		},
-		ResponseHeaderTimeout: targetRequestTimeout,
-		DisableKeepAlives:     true,
+type limitedResponseBuffer struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (b *limitedResponseBuffer) Write(data []byte) (int, error) {
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		keep := len(data)
+		if keep > remaining {
+			keep = remaining
+		}
+		_, _ = b.buffer.Write(data[:keep])
 	}
-	return &http.Client{Transport: transport, Timeout: targetRequestTimeout}
+	if len(data) > remaining {
+		b.exceeded = true
+	}
+	// Continue draining stdout so curl cannot block on a full pipe; storage is
+	// bounded independently of the remote response size.
+	return len(data), nil
+}
+
+func responseBody(raw string) (string, bool) {
+	separator := strings.Index(raw, "\r\n\r\n")
+	separatorLength := 4
+	if separator < 0 {
+		separator = strings.Index(raw, "\n\n")
+		separatorLength = 2
+	}
+	if separator < 0 {
+		return "", false
+	}
+	return raw[separator+separatorLength:], true
 }

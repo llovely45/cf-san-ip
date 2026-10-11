@@ -14,7 +14,6 @@ import (
 
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
-	"cf-san/internal/scanner"
 )
 
 type App struct {
@@ -68,13 +67,13 @@ func (app *App) Run() error {
 		fmt.Fprintln(app.Output, "1. 初始化环境 / 检查后端连接")
 		fmt.Fprintln(app.Output, "2. 运行扫描（后台）")
 		fmt.Fprintln(app.Output, "3. 暂停扫描")
-		fmt.Fprintln(app.Output, "4. 设置 ZMap 发包速率（PPS）")
-		fmt.Fprintln(app.Output, "5. 设置 ZGrab2 并发数")
+		fmt.Fprintln(app.Output, "4. 设置 Masscan 发包速率（PPS）")
+		fmt.Fprintln(app.Output, "5. 设置 curl 验证并发数")
 		fmt.Fprintln(app.Output, "6. 设置 ASN")
 		fmt.Fprintln(app.Output, "7. 查看配置与状态")
 		fmt.Fprintln(app.Output, "8. 修改后端地址")
 		fmt.Fprintln(app.Output, "9. 修改 API Token")
-		fmt.Fprintln(app.Output, "10. 更新 cf-san 和 ZGrab2 到最新版本")
+		fmt.Fprintln(app.Output, "10. 更新 cf-san 到最新版本")
 		fmt.Fprintln(app.Output, "11. 查看扫描日志（最近 100 行）")
 		fmt.Fprintln(app.Output, "12. 退出")
 		choice, err := readLine(reader, app.Output, "请选择：")
@@ -176,21 +175,11 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if err := config.ValidateForScan(*cfg); err != nil {
 		return err
 	}
-	if _, err := exec.LookPath("zmap"); err != nil {
-		return errors.New("未找到 zmap；请检查安装")
+	if _, err := exec.LookPath("masscan"); err != nil {
+		return errors.New("未找到 masscan；请运行 cf-san 安装脚本")
 	}
-	if _, err := exec.LookPath("zgrab2"); err != nil {
-		return errors.New("未找到 zgrab2；请检查安装")
-	}
-	copied, err := ensureZGrab2Blocklist(
-		"/usr/local/share/cf-san/zgrab2-blocklist.conf",
-		scanner.DefaultBlocklistPath,
-	)
-	if err != nil {
-		return fmt.Errorf("ZGrab2 屏蔽名单初始化失败：%w", err)
-	}
-	if copied {
-		fmt.Fprintln(app.Output, "已安装 ZGrab2 默认屏蔽名单。")
+	if _, err := exec.LookPath("curl"); err != nil {
+		return errors.New("未找到 curl；请运行 cf-san 安装脚本")
 	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
@@ -211,8 +200,11 @@ func (app *App) start(cfg *config.Config) error {
 	if err := config.ValidateForScan(*cfg); err != nil {
 		return err
 	}
-	if err := scanner.ValidateBlocklistFile(scanner.DefaultBlocklistPath); err != nil {
-		return fmt.Errorf("ZGrab2 屏蔽名单未初始化，请先选择菜单 1：%w", err)
+	if _, err := exec.LookPath("masscan"); err != nil {
+		return errors.New("未找到 masscan；请先选择菜单 1 初始化环境")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		return errors.New("未找到 curl；请先选择菜单 1 初始化环境")
 	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
@@ -245,9 +237,9 @@ func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice s
 	key, prompt := "", ""
 	switch choice {
 	case "4":
-		key, prompt = "limit", "新的 ZMap 发包速率（PPS）："
+		key, prompt = "limit", "新的 Masscan 发包速率（PPS）："
 	case "5":
-		key, prompt = "senders", "新的 ZGrab2 并发数："
+		key, prompt = "workers", "新的 curl 验证并发数："
 	case "6":
 		key, prompt = "asn", "新的 ASN："
 	case "8":
@@ -280,8 +272,8 @@ func (app *App) printStatus(cfg config.Config) {
 	if cfg.Token != "" {
 		tokenState = cfg.Token
 	}
-	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nZMap PPS 上限：%d\nZGrab2 并发：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
-		cfg.URL, cfg.ASN, cfg.Limit, cfg.Senders, tokenState, cfg.AgentID, state)
+	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nMasscan PPS 上限：%d\ncurl 验证并发：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
+		cfg.URL, cfg.ASN, cfg.Limit, cfg.CurlWorkers, tokenState, cfg.AgentID, state)
 }
 
 func UpdateSetting(cfg *config.Config, key, raw string) error {
@@ -296,15 +288,15 @@ func UpdateSetting(cfg *config.Config, key, raw string) error {
 	case "limit":
 		parsed, err := strconv.ParseUint(value, 10, 64)
 		if err != nil || parsed == 0 || parsed > math.MaxInt64 {
-			return errors.New("ZMap 发包速率必须是大于零的整数")
+			return errors.New("Masscan 发包速率必须是大于零的整数")
 		}
 		cfg.Limit = parsed
-	case "senders":
+	case "workers":
 		parsed, err := strconv.ParseUint(value, 10, 32)
-		if err != nil || parsed == 0 {
-			return errors.New("ZGrab2 并发数必须是正整数")
+		if err != nil || parsed == 0 || parsed > 4096 {
+			return errors.New("curl 验证并发数必须是 1 到 4096 之间的整数")
 		}
-		cfg.Senders = uint32(parsed)
+		cfg.CurlWorkers = uint32(parsed)
 	case "url":
 		if err := config.ValidateBackendURL(value); err != nil {
 			return err

@@ -3,7 +3,6 @@ package scanner
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -27,11 +26,10 @@ type Reporter interface {
 type TraceProber func(context.Context, string) (probe.TraceResponse, error)
 
 type RunnerConfig struct {
-	ZMapPath          string
-	ZGrab2Path        string
-	BlocklistPath     string
+	MasscanPath       string
+	CurlPath          string
 	Limit             uint64
-	Senders           uint32
+	CurlWorkers       uint32
 	HeartbeatInterval time.Duration
 }
 
@@ -41,31 +39,19 @@ type Runner struct {
 	TraceProbe TraceProber
 }
 
-type zgrabResult struct {
-	IP   string `json:"ip"`
-	Data struct {
-		TLS struct {
-			Status string `json:"status"`
-		} `json:"tls"`
-	} `json:"data"`
-}
-
 func (r *Runner) normalizedConfig() RunnerConfig {
 	config := r.Config
-	if config.ZMapPath == "" {
-		config.ZMapPath = "zmap"
+	if config.MasscanPath == "" {
+		config.MasscanPath = "masscan"
 	}
-	if config.ZGrab2Path == "" {
-		config.ZGrab2Path = "zgrab2"
-	}
-	if config.BlocklistPath == "" {
-		config.BlocklistPath = DefaultBlocklistPath
+	if config.CurlPath == "" {
+		config.CurlPath = "curl"
 	}
 	if config.Limit == 0 {
 		config.Limit = 100
 	}
-	if config.Senders == 0 {
-		config.Senders = 100
+	if config.CurlWorkers == 0 {
+		config.CurlWorkers = 100
 	}
 	if config.HeartbeatInterval <= 0 {
 		config.HeartbeatInterval = 10 * time.Minute
@@ -114,11 +100,11 @@ func (r *Runner) validateRun() (RunnerConfig, error) {
 		return RunnerConfig{}, errors.New("backend reporter is required")
 	}
 	config := r.normalizedConfig()
-	if config.Limit == 0 || config.Senders == 0 {
-		return RunnerConfig{}, errors.New("ZMap rate and ZGrab2 sender count must be positive")
+	if config.Limit == 0 || config.CurlWorkers == 0 {
+		return RunnerConfig{}, errors.New("Masscan rate and curl worker count must be positive")
 	}
-	if err := ValidateBlocklistFile(config.BlocklistPath); err != nil {
-		return RunnerConfig{}, err
+	if config.CurlWorkers > 4096 {
+		return RunnerConfig{}, errors.New("curl worker count cannot exceed 4096")
 	}
 	return config, nil
 }
@@ -176,14 +162,11 @@ func (r *Runner) runBlock(
 	traceProbe := r.TraceProbe
 	if traceProbe == nil {
 		traceProbe = func(ctx context.Context, ip string) (probe.TraceResponse, error) {
-			return probe.FetchCFTrace(ctx, ip, nil)
+			return probe.FetchCFTrace(ctx, ip, config.CurlPath)
 		}
 	}
-	probeCandidate := func(ip string) error {
-		latestMu.Lock()
-		latestIP = ip
-		latestMu.Unlock()
-		trace, err := traceProbe(blockCtx, ip)
+	probeCandidate := func(probeCtx context.Context, ip string) error {
+		trace, err := traceProbe(probeCtx, ip)
 		if err != nil || !probe.ValidateCFResolveResponse(trace.RawResponse) {
 			return nil
 		}
@@ -196,7 +179,7 @@ func (r *Runner) runBlock(
 			ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR,
 			Status: "active", LatestIP: ip, Candidate: candidate,
 		}
-		if err := r.reportWithRetry(blockCtx, report); err != nil {
+		if err := r.reportWithRetry(probeCtx, report); err != nil {
 			return fmt.Errorf("cannot persist valid scan result: %w", err)
 		}
 		return nil
@@ -235,97 +218,123 @@ func (r *Runner) runBlockPipeline(
 	block prefix.Block,
 	config RunnerConfig,
 	onTarget func(string),
-	probeCandidate func(string) error,
+	probeCandidate func(context.Context, string) error,
 ) error {
-	zmapArgs := []string{
-		"-M", "tcp_synscan",
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	args := []string{
 		"-p", "443",
-		"-r", strconv.FormatUint(config.Limit, 10),
-		"--cooldown-time=1",
-		"--output-module=csv",
-		"--output-fields=saddr",
-		"--output-filter=success = 1",
-		"-o", "-",
+		"--rate", strconv.FormatUint(config.Limit, 10),
+		"--wait", "1",
+		"--interactive",
+		"--nostatus",
 		block.BlockCIDR,
 	}
-	zmapCommand := newGroupCommand(ctx, r.normalizedConfig().ZMapPath, zmapArgs...)
-	zmapCommand.Stderr = os.Stderr
-	zmapOutput, err := zmapCommand.StdoutPipe()
+	command := newGroupCommand(scanCtx, r.normalizedConfig().MasscanPath, args...)
+	command.Stderr = os.Stderr
+	output, err := command.StdoutPipe()
 	if err != nil {
-		return errors.New("cannot open ZMap output")
+		return errors.New("cannot open Masscan output")
+	}
+	if err := command.Start(); err != nil {
+		return errors.New("cannot start Masscan; verify it is installed and run cf-san with root privileges")
 	}
 
-	zgrabArgs := []string{
-		"tls",
-		"--senders", strconv.FormatUint(uint64(config.Senders), 10),
-		"--port", "443",
-		"--connect-timeout", "1s",
-		"--target-timeout", "1s",
-		"--blocklist-file", config.BlocklistPath,
+	targets := make(chan string, int(config.CurlWorkers))
+	var workers sync.WaitGroup
+	var firstError error
+	var errorMu sync.Mutex
+	setError := func(err error) {
+		if err == nil {
+			return
+		}
+		errorMu.Lock()
+		if firstError == nil {
+			firstError = err
+			cancel()
+		}
+		errorMu.Unlock()
 	}
-	zgrabCommand := newGroupCommand(ctx, r.normalizedConfig().ZGrab2Path, zgrabArgs...)
-	zgrabCommand.Stdin = zmapOutput
-	zgrabCommand.Stderr = os.Stderr
-	zgrabOutput, err := zgrabCommand.StdoutPipe()
-	if err != nil {
-		return errors.New("cannot open ZGrab2 output")
-	}
-	if err := zgrabCommand.Start(); err != nil {
-		return errors.New("cannot start ZGrab2; verify it is installed")
-	}
-	if err := zmapCommand.Start(); err != nil {
-		_ = zgrabCommand.Process.Kill()
-		_ = zgrabCommand.Wait()
-		return errors.New("cannot start ZMap; verify it is installed and has required privileges")
+	for worker := uint32(0); worker < config.CurlWorkers; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for ip := range targets {
+				if scanCtx.Err() != nil {
+					continue
+				}
+				if err := probeCandidate(scanCtx, ip); err != nil {
+					setError(err)
+					return
+				}
+			}
+		}()
 	}
 
-	outputScanner := bufio.NewScanner(zgrabOutput)
+	outputScanner := bufio.NewScanner(output)
 	outputScanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	var callbackErr error
+	seen := make(map[string]struct{})
 	for outputScanner.Scan() {
-		line := outputScanner.Bytes()
-		var result zgrabResult
-		if err := json.Unmarshal(line, &result); err != nil {
+		if scanCtx.Err() != nil {
+			break
+		}
+		ip, ok := parseMasscanInteractiveOpen443(outputScanner.Text(), block)
+		if !ok {
 			continue
 		}
-		address, err := netip.ParseAddr(result.IP)
-		if err != nil || !address.Is4() {
+		if _, duplicate := seen[ip]; duplicate {
 			continue
 		}
-		blockPrefix, err := netip.ParsePrefix(block.BlockCIDR)
-		if err != nil || !blockPrefix.Contains(address) {
-			continue
-		}
-		onTarget(address.String())
-		if !strings.EqualFold(result.Data.TLS.Status, "success") {
-			continue
-		}
-		if err := probeCandidate(address.String()); err != nil {
-			callbackErr = err
-			_ = zgrabCommand.Process.Kill()
-			_ = zmapCommand.Process.Kill()
+		seen[ip] = struct{}{}
+		onTarget(ip)
+		select {
+		case targets <- ip:
+		case <-scanCtx.Done():
 			break
 		}
 	}
-	readErr := outputScanner.Err()
-	zgrabErr := zgrabCommand.Wait()
-	zmapErr := zmapCommand.Wait()
-	if callbackErr != nil {
-		return callbackErr
+	outputErr := outputScanner.Err()
+	if outputErr != nil {
+		setError(errors.New("cannot parse Masscan output stream"))
+	}
+	close(targets)
+	workers.Wait()
+	commandErr := command.Wait()
+
+	errorMu.Lock()
+	workerError := firstError
+	errorMu.Unlock()
+	if workerError != nil {
+		return workerError
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if readErr != nil {
-		return errors.New("cannot parse ZGrab2 output stream")
+	if outputErr != nil {
+		return errors.New("cannot parse Masscan output stream")
 	}
-	if zmapErr != nil {
-		return errors.New("ZMap scan failed")
-	}
-	if zgrabErr != nil {
-		return errors.New("ZGrab2 TLS scan failed")
+	if commandErr != nil {
+		return errors.New("Masscan scan failed")
 	}
 	return nil
+}
+
+func parseMasscanInteractiveOpen443(line string, block prefix.Block) (string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 6 || fields[0] != "Discovered" || fields[1] != "open" ||
+		fields[2] != "port" || fields[3] != "443/tcp" || fields[4] != "on" {
+		return "", false
+	}
+	address, err := netip.ParseAddr(fields[5])
+	if err != nil || !address.Is4() {
+		return "", false
+	}
+	blockPrefix, err := netip.ParsePrefix(block.BlockCIDR)
+	if err != nil || !blockPrefix.Contains(address) {
+		return "", false
+	}
+	return address.String(), true
 }
 
 func newGroupCommand(ctx context.Context, path string, args ...string) *exec.Cmd {

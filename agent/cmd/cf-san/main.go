@@ -55,7 +55,7 @@ func run(arguments []string) error {
 	switch command {
 	case "menu":
 		if os.Geteuid() != 0 {
-			return errors.New("请使用 sudo cf-san 打开菜单；配置文件与 ZMap 扫描需要 root 权限")
+			return errors.New("请使用 sudo cf-san 打开菜单；配置文件与 Masscan 扫描需要 root 权限")
 		}
 		if config.Validate(cfg) == nil {
 			if err := config.Save(options.configPath, cfg); err != nil {
@@ -93,8 +93,9 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	urlValue := flags.String("url", "", "HTTPS Worker base URL")
 	tokenValue := flags.String("token", "", "API Bearer token")
 	asnValue := flags.Uint("asn", 0, "AS number")
-	limitValue := flags.Uint64("limit", 0, "ZMap packets per second")
-	sendersValue := flags.Uint("senders", 0, "ZGrab2 sender concurrency")
+	limitValue := flags.Uint64("limit", 0, "Masscan packets per second")
+	workersValue := flags.Uint("workers", 0, "Concurrent curl validations")
+	sendersValue := flags.Uint("senders", 0, "Deprecated alias for --workers")
 	configPath := flags.String("config", "", "local configuration path")
 	if err := flags.Parse(arguments); err != nil {
 		return cliOptions{}, err
@@ -104,12 +105,15 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	}
 	options := cliOptions{configPath: *configPath}
 	limitWasSet := false
+	workersWasSet := false
 	sendersWasSet := false
 	flags.Visit(func(item *flag.Flag) {
-		if item.Name == "limit" {
+		switch item.Name {
+		case "limit":
 			limitWasSet = true
-		}
-		if item.Name == "senders" {
+		case "workers":
+			workersWasSet = true
+		case "senders":
 			sendersWasSet = true
 		}
 	})
@@ -132,12 +136,19 @@ func parseOptions(arguments []string) (cliOptions, error) {
 		value := *limitValue
 		options.overrides.Limit = &value
 	}
-	if sendersWasSet {
-		if uint64(*sendersValue) > uint64(^uint32(0)) {
-			return cliOptions{}, errors.New("sender count exceeds 32-bit range")
+	if workersWasSet && sendersWasSet {
+		return cliOptions{}, errors.New("specify only one of --workers and deprecated --senders")
+	}
+	if workersWasSet || sendersWasSet {
+		value := *workersValue
+		if sendersWasSet {
+			value = *sendersValue
 		}
-		value := uint32(*sendersValue)
-		options.overrides.Senders = &value
+		if uint64(value) > uint64(^uint32(0)) {
+			return cliOptions{}, errors.New("curl worker count exceeds 32-bit range")
+		}
+		parsed := uint32(value)
+		options.overrides.CurlWorkers = &parsed
 	}
 	return options, nil
 }
@@ -146,14 +157,14 @@ func runScan(cfg config.Config, configPath string) error {
 	if err := config.ValidateForScan(cfg); err != nil {
 		return err
 	}
-	if _, err := exec.LookPath("zmap"); err != nil {
-		return errors.New("zmap is not installed")
-	}
-	if _, err := exec.LookPath("zgrab2"); err != nil {
-		return errors.New("zgrab2 is not installed")
-	}
 	if os.Geteuid() != 0 {
-		return errors.New("ZMap requires elevated privileges; run cf-san through sudo")
+		return errors.New("Masscan requires elevated privileges; run cf-san through sudo")
+	}
+	if _, err := exec.LookPath("masscan"); err != nil {
+		return errors.New("masscan is not installed; rerun the cf-san installer")
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		return errors.New("curl is not installed; rerun the cf-san installer")
 	}
 	client, err := backend.NewClient(cfg.URL, cfg.Token)
 	if err != nil {
@@ -171,11 +182,10 @@ func runScan(cfg config.Config, configPath string) error {
 	defer manager.RemoveIfCurrent(pid)
 	runner := scanner.Runner{
 		Config: scanner.RunnerConfig{
-			ZMapPath:      "zmap",
-			ZGrab2Path:    "zgrab2",
-			BlocklistPath: scanner.DefaultBlocklistPath,
-			Limit:         cfg.Limit,
-			Senders:       cfg.Senders,
+			MasscanPath: "masscan",
+			CurlPath:    "curl",
+			Limit:       cfg.Limit,
+			CurlWorkers: cfg.CurlWorkers,
 		},
 		Reporter: client,
 	}

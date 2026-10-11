@@ -4,11 +4,13 @@ Cloudflare Workers + D1 IP pool with an authenticated admin UI, `/postip` and `/
 
 ## Agent scan scope and behavior
 
-Only run `cf-san` against an ASN and IPv4 prefixes that you own or are explicitly authorized to assess. The agent asks RIPEstat for currently originating IPv4 prefixes, rejects non-public/mixed special-purpose ranges, and scans eligible ranges in numerically ordered blocks no larger than `/16` (a source narrower than `/16` remains intact). Nested/overlapping source prefixes are scanned only once. ZMap probes TCP/443; its response cooldown, ZGrab2 connect/target timeouts, and the direct Cloudflare trace request timeouts are each set to one second. The Worker returns the full current prefix set and sparse checkpoints; the Go agent lazily generates the ordered block plan instead of materializing it in Worker or D1. Existing `/24` checkpoints are mapped to their containing new block and conservatively rescanned; an active block can be repeated after pause, while completed new-format blocks are skipped. If the announced prefix set changes, the cursor resets so newly added lower-address ranges cannot be skipped; the scan range is never capped to make planning faster. Each invocation completes one current prefix plan and then stops; start it again later to refresh RIPEstat.
+Only run `cf-san` against an ASN and IPv4 prefixes that you own or are explicitly authorized to assess. The agent asks RIPEstat for currently originating IPv4 prefixes, rejects non-public/mixed special-purpose ranges, and scans eligible ranges in numerically ordered blocks no larger than `/16` (a source narrower than `/16` remains intact). Nested/overlapping source prefixes are scanned only once. Blocks run in ascending order; Masscan may permute addresses inside a block. The agent invokes Masscan for TCP/443 with the configured packet rate and a one-second receive wait, then sends only open TCP/443 results to a bounded pool of concurrent `curl` requests for `/cdn-cgi/trace`. There is no ZMap or ZGrab2 scan stage. The Worker returns the full current prefix set and sparse checkpoints; the Go agent lazily generates the ordered block plan instead of materializing it in Worker or D1. Existing `/24` checkpoints are mapped to their containing new block and conservatively rescanned; an active block can be repeated after pause, while completed new-format blocks are skipped. If the announced prefix set changes, the cursor resets so newly added lower-address ranges cannot be skipped; the scan range is never capped to make planning faster. Each invocation completes one current prefix plan and then stops; start it again later to refresh RIPEstat.
 
-`--limit` is the ZMap initial TCP probe rate in packets per second (default `100`), not a total interface shaper for subsequent TLS/HTTPS traffic. ZGrab2 concurrency is configured separately (`--senders`, default `100`). Set a conservative rate, follow the target network's acceptable-use policy, and pause promptly if asked. The agent never sends the API token to scan targets. HTTPS trace probes disable certificate verification only for the selected public IP; agent-to-Worker and agent-to-RIPEstat connections use ordinary TLS verification.
+`--limit` is the Masscan initial TCP probe rate in packets per second (default `100`), not a total interface shaper for curl traffic. `--workers` sets the maximum concurrent curl validations (default `100`). The old `--senders` flag is retained as an alias for `--workers`, and saved configs with the old `senders` field are migrated to `curlWorkers`. Set a conservative rate, follow the target network's acceptable-use policy, and pause promptly if asked. The agent never sends the API token to scan targets. Curl certificate verification is disabled only for the selected public-IP probe; agent-to-Worker and agent-to-RIPEstat connections use ordinary TLS verification.
 
-ZGrab2 first requires a successful TLS handshake; it is then followed by the direct `/cdn-cgi/trace` request. A trace response is accepted only when its HTTP headers contain `Server: cloudflare` (case-insensitive), its body does not contain `error code: 1034`, and it contains one usable, non-empty, whitespace-free `loc=` value. HTTP status is not itself a rejection. Missing `loc=` means the result is not saved. Valid candidates are immediately reported to D1; other probes only update block-level progress. A progress heartbeat is sent every ten minutes and when a block completes, with the latest known open-port/TLS target IP when available. This version does not apply a separate JA3/JARM or certificate-fingerprint allowlist; Cloudflare identity is decided by the agreed HTTPS response check. A heartbeat does not claim an exact last attempted IP because ZMap's in-block permutation and non-responsive hosts do not expose a reliable ordered cursor.
+Each open TCP/443 result gets a direct HTTPS GET to `https://<IP>:443/cdn-cgi/trace`, with one-second connect and overall timeouts. A trace response is accepted only when its HTTP headers contain `Server: cloudflare` (case-insensitive), its body does not contain `error code: 1034`, and it contains one usable, non-empty, whitespace-free `loc=` value. HTTP status is not itself a rejection. Missing `loc=` means the result is not saved. Valid candidates are immediately reported to D1; unsuccessful curl responses only update block-level progress. A progress heartbeat is sent every ten minutes and when a block completes, with the latest open TCP/443 IP reported by Masscan when available. Masscan does not emit a reliable ordered cursor for every attempted/non-responsive address, so the heartbeat is not an exact last attempted IP.
+
+The trace URL uses an IP literal, not a per-target business hostname. If an Nginx stream proxy routes only when a domain SNI is present, this IP-only probe will not select that domain-specific route; testing such a route requires a known hostname/SNI.
 
 ## Worker configuration for Agent installation
 
@@ -21,33 +23,33 @@ The tag workflow runs the full Worker, UI, Go, migration, and installer checks. 
 - `cf-san_linux_amd64.tar.gz` and its `.sha256` file
 - `cf-san_linux_arm64.tar.gz` and its `.sha256` file
 
-Each archive contains the Go agent, the pinned ZGrab2 v1.0.0 binary, its upstream IPv4/IPv6 special-purpose-address blocklist, and the third-party license notice. ZMap is installed from the Debian/Alpine package manager on the target host. The installer checks the archive SHA-256 before installing the binaries and blocklist.
+Each archive contains only the Go `cf-san` agent. The installer installs Masscan and its runtime dependencies through the Debian or Alpine package manager, then verifies the agent archive SHA-256. On Debian, it explicitly installs or repairs the `libpcap` runtime needed by Masscan, including when updating an already-installed agent. The old bundled `zgrab2` binary and shared blocklist are removed when upgrading. Existing system-installed ZMap packages are not automatically purged, but the new agent no longer invokes or requires ZMap.
 
 ## Linux installation and menu
 
-The generated command is intended for a Debian or Alpine Linux host with outbound HTTPS access and root/sudo privileges. It requires `curl` and a POSIX `sh` to fetch and run the script; the script installs `zmap`, CA certificates, and archive utilities, then installs `cf-san` and bundled `zgrab2` under `/usr/local/bin`.
+The generated command is intended for a Debian or Alpine Linux host with outbound HTTPS access and root/sudo privileges. It requires `curl` and a POSIX `sh` to fetch and run the script; the script installs Masscan, CA certificates, and archive utilities, then installs `cf-san` under `/usr/local/bin`.
 
 Run `sudo cf-san` to open the text menu. It supports:
 
-1. Initialize/check ZMap and ZGrab2, install the bundled blocklist if missing, and check backend authentication, ASN, and the current scan plan.
+1. Initialize/check Masscan and curl availability, then check backend authentication, ASN, and the current scan plan.
 2. Start a one-pass scan in the background.
 3. Pause the scan with SIGTERM; the active block remains incomplete.
-4. Set ZMap rate in packets per second.
-5. Set ZGrab2 sender concurrency.
+4. Set Masscan rate in packets per second.
+5. Set concurrent curl validation workers.
 6. Set ASN.
 7. View the backend address, plaintext API token, ASN, rate, concurrency, Agent ID, and process status.
 8. Change the backend HTTPS address.
 9. Change the API token.
-10. After pausing any active scan, fetch the current installer script from the configured Worker and use it to install the latest GitHub Release of `cf-san` and bundled ZGrab2. This mode skips OS package installation and preserves the saved scan settings.
+10. After pausing any active scan, fetch the current installer script from the configured Worker and install the latest GitHub Release of `cf-san`. If Masscan is missing, this update path installs it; on Debian it also repairs a missing `libpcap` runtime dependency.
 11. Display the latest 100 lines from `/var/log/cf-san/agent.log`; use the shown `tail -f` command for live following.
 12. Exit. After updating, exit and run `sudo cf-san` again to load the new binary.
 
-Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. The bundled ZGrab2 special-purpose-address blocklist is installed at `/etc/cf-san/zgrab2-blocklist.conf` unless an existing custom file is present. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san/agent.log`. The first version does not install a boot-time service.
+Local settings are stored at `/etc/cf-san/config.json`, owner-readable only (`0600`); credentials remain plaintext by design, so protect the host and backups. Runtime PID metadata is under `/run/cf-san`; logs are under `/var/log/cf-san/agent.log`. The first version does not install a boot-time service.
 
 CLI settings override saved values, for example:
 
 ```sh
-sudo cf-san configure --url 'https://worker.example' --token 'YOUR_API_TOKEN' --asn 906 --limit 100 --senders 100
+sudo cf-san configure --url 'https://worker.example' --token 'YOUR_API_TOKEN' --asn 906 --limit 100 --workers 100
 sudo cf-san run --config /etc/cf-san/config.json
 ```
 

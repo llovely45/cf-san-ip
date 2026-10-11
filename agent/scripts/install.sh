@@ -51,6 +51,50 @@ printf '%s\n' "$RELEASE_REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+
   fail 'release repository is not configured on the Worker'
 
 [ "$(id -u)" -eq 0 ] || fail 'run this script with sudo or as root'
+
+debian_pcap_package() {
+  if apt-cache show libpcap0.8t64 2>/dev/null | grep -q '^Package: libpcap0.8t64$'; then
+    printf '%s\n' libpcap0.8t64
+  else
+    printf '%s\n' libpcap0.8
+  fi
+}
+
+ensure_debian_pcap() {
+  command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+  command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
+  command -v dpkg-query >/dev/null 2>&1 || fail 'dpkg-query is required on Debian'
+  if dpkg-query -s libpcap0.8t64 >/dev/null 2>&1 || dpkg-query -s libpcap0.8 >/dev/null 2>&1; then
+    return 0
+  fi
+  apt-get update
+  PCAP_PACKAGE=$(debian_pcap_package)
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$PCAP_PACKAGE"
+}
+
+install_masscan() {
+  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}" in
+    debian)
+      command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+      command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
+      apt-get update
+      PCAP_PACKAGE=$(debian_pcap_package)
+      DEBIAN_FRONTEND=noninteractive apt-get install -y masscan "$PCAP_PACKAGE"
+      ;;
+    alpine)
+      command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
+      apk add --no-cache masscan
+      ;;
+    *)
+      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      ;;
+  esac
+  command -v masscan >/dev/null 2>&1 || fail 'Masscan installation failed; install the masscan package and retry'
+}
+
 if [ "$UPDATE_ONLY" -eq 0 ]; then
   [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
   # shellcheck disable=SC1091
@@ -59,22 +103,40 @@ if [ "$UPDATE_ONLY" -eq 0 ]; then
     debian)
       command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
       apt-get update
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip zmap
+      command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
+      PCAP_PACKAGE=$(debian_pcap_package)
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip masscan "$PCAP_PACKAGE"
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-      apk add --no-cache ca-certificates curl coreutils tar gzip zmap
+      apk add --no-cache ca-certificates curl coreutils tar gzip masscan
       ;;
     *)
       fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
       ;;
   esac
-  command -v zmap >/dev/null 2>&1 || fail 'ZMap installation failed; install the zmap package and retry'
 else
   for command_name in curl tar gzip sha256sum install awk mktemp; do
     command -v "$command_name" >/dev/null 2>&1 || fail "required update command not found: $command_name"
   done
+  if ! command -v masscan >/dev/null 2>&1; then
+    install_masscan
+  else
+    # Masscan 1.3.2 on Debian Bookworm does not declare its dynamically
+    # loaded libpcap runtime as a package dependency. Repair older installs too.
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [ "${ID:-}" = debian ]; then
+      command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+      command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
+      command -v dpkg-query >/dev/null 2>&1 || fail 'dpkg-query is required on Debian'
+      ensure_debian_pcap
+    fi
+  fi
 fi
+
+command -v masscan >/dev/null 2>&1 || fail 'Masscan is not installed; install the masscan package and retry'
+command -v curl >/dev/null 2>&1 || fail 'curl is not installed; install curl and retry'
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -96,23 +158,19 @@ ACTUAL_SHA=$(sha256sum "${TEMP_DIR}/${ARCHIVE}" | awk '{ print $1 }')
 
 tar -xzf "${TEMP_DIR}/${ARCHIVE}" -C "$TEMP_DIR"
 [ -x "${TEMP_DIR}/cf-san" ] || fail 'release archive does not contain cf-san'
-[ -x "${TEMP_DIR}/zgrab2" ] || fail 'release archive does not contain zgrab2'
-[ -s "${TEMP_DIR}/zgrab2-blocklist.conf" ] || fail 'release archive does not contain a non-empty ZGrab2 blocklist'
 install -m 0755 "${TEMP_DIR}/cf-san" /usr/local/bin/cf-san
-install -m 0755 "${TEMP_DIR}/zgrab2" /usr/local/bin/zgrab2
 install -d -m 0755 /usr/local/share/cf-san
-install -m 0644 "${TEMP_DIR}/zgrab2-blocklist.conf" /usr/local/share/cf-san/zgrab2-blocklist.conf
 install -d -m 0755 /etc/cf-san
-if [ ! -s /etc/cf-san/zgrab2-blocklist.conf ]; then
-  install -m 0644 "${TEMP_DIR}/zgrab2-blocklist.conf" /etc/cf-san/zgrab2-blocklist.conf
-fi
-if [ -f "${TEMP_DIR}/THIRD_PARTY_NOTICES.txt" ]; then
-  install -m 0644 "${TEMP_DIR}/THIRD_PARTY_NOTICES.txt" /usr/local/share/cf-san-THIRD_PARTY_NOTICES.txt
-fi
+
+# Remove artifacts that earlier cf-san installers bundled. Do not uninstall a
+# system ZMap package because it may be used independently by the host owner.
+rm -f /usr/local/bin/zgrab2 \
+  /usr/local/share/cf-san/zgrab2-blocklist.conf \
+  /usr/local/share/cf-san-THIRD_PARTY_NOTICES.txt
 
 /usr/local/bin/cf-san configure --url "$BACKEND_URL" --token "$API_TOKEN"
 if [ "$UPDATE_ONLY" -eq 1 ]; then
-  printf 'cf-san and bundled zgrab2 updated. Exit and restart `cf-san` to use the new version.\n'
+  printf 'cf-san updated. Masscan is installed; ZMap and ZGrab2 are no longer used. Exit and restart `cf-san` to use the new version.\n'
 else
   printf 'cf-san installed. Run `cf-san` to initialize settings and open the text menu.\n'
 fi

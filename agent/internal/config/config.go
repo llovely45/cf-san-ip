@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,24 +15,64 @@ import (
 )
 
 type Config struct {
-	URL     string `json:"url"`
-	Token   string `json:"token"`
-	ASN     uint32 `json:"asn"`
-	Limit   uint64 `json:"limit"`
-	Senders uint32 `json:"senders"`
-	AgentID string `json:"agentId"`
+	URL         string `json:"url"`
+	Token       string `json:"token"`
+	ASN         uint32 `json:"asn"`
+	Limit       uint64 `json:"limit"`
+	CurlWorkers uint32 `json:"curlWorkers"`
+	AgentID     string `json:"agentId"`
 }
 
 type Overrides struct {
-	URL     *string
-	Token   *string
-	ASN     *uint32
-	Limit   *uint64
-	Senders *uint32
+	URL         *string
+	Token       *string
+	ASN         *uint32
+	Limit       *uint64
+	CurlWorkers *uint32
+}
+
+type configJSON struct {
+	URL         string  `json:"url"`
+	Token       string  `json:"token"`
+	ASN         uint32  `json:"asn"`
+	Limit       uint64  `json:"limit"`
+	CurlWorkers uint32  `json:"curlWorkers"`
+	Senders     *uint32 `json:"senders"`
+	AgentID     string  `json:"agentId"`
+}
+
+// UnmarshalJSON migrates the pre-Masscan senders setting to CurlWorkers while
+// continuing to reject unknown fields in the protected local config file.
+func (cfg *Config) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var value configJSON
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	workers := value.CurlWorkers
+	if workers == 0 && value.Senders != nil {
+		workers = *value.Senders
+	}
+	*cfg = Config{
+		URL:         value.URL,
+		Token:       value.Token,
+		ASN:         value.ASN,
+		Limit:       value.Limit,
+		CurlWorkers: workers,
+		AgentID:     value.AgentID,
+	}
+	return nil
 }
 
 func Defaults() Config {
-	return Config{Limit: 100, Senders: 100, AgentID: newAgentID()}
+	return Config{Limit: 100, CurlWorkers: 100, AgentID: newAgentID()}
 }
 
 func ValidateBackendURL(value string) error {
@@ -50,10 +91,13 @@ func Validate(cfg Config) error {
 		return errors.New("API token is required")
 	}
 	if cfg.Limit == 0 {
-		return errors.New("ZMap rate limit must be greater than zero")
+		return errors.New("Masscan rate limit must be greater than zero")
 	}
-	if cfg.Senders == 0 {
-		return errors.New("ZGrab2 sender count must be greater than zero")
+	if cfg.CurlWorkers == 0 {
+		return errors.New("curl worker count must be greater than zero")
+	}
+	if cfg.CurlWorkers > 4096 {
+		return errors.New("curl worker count cannot exceed 4096")
 	}
 	return nil
 }
@@ -84,14 +128,14 @@ func MergeOverrides(base Config, overrides Overrides) Config {
 	if overrides.Limit != nil {
 		base.Limit = *overrides.Limit
 	}
-	if overrides.Senders != nil {
-		base.Senders = *overrides.Senders
+	if overrides.CurlWorkers != nil {
+		base.CurlWorkers = *overrides.CurlWorkers
 	}
 	if base.Limit == 0 {
 		base.Limit = 100
 	}
-	if base.Senders == 0 {
-		base.Senders = 100
+	if base.CurlWorkers == 0 {
+		base.CurlWorkers = 100
 	}
 	if base.AgentID == "" {
 		base.AgentID = newAgentID()
@@ -117,10 +161,24 @@ func Load(path string) (Config, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, errors.New("agent config is invalid JSON")
 	}
+	if err := configHasNoTrailingValue(decoder); err != nil {
+		return Config{}, errors.New("agent config is invalid JSON")
+	}
 	if err := Validate(cfg); err != nil {
 		return Config{}, fmt.Errorf("agent config is invalid: %w", err)
 	}
 	return cfg, nil
+}
+
+func configHasNoTrailingValue(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 func Save(path string, cfg Config) error {

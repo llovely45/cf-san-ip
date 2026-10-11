@@ -2,37 +2,30 @@ package probe
 
 import (
 	"context"
-	"io"
-	"net/http"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (fn roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
-	return fn(request)
+func makeCurl(t *testing.T, dir, output string, exitCode int) string {
+	t.Helper()
+	path := filepath.Join(dir, "curl")
+	script := fmt.Sprintf("#!/bin/sh\nset -eu\nprintf '%%s\\n' \"$*\" > \"$CURL_ARGS_FILE\"\nprintf '%%s' \"$CURL_RESPONSE\"\nexit %d\n", exitCode)
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CURL_RESPONSE", output)
+	return path
 }
 
-func TestFetchCFTraceUsesOnlyIPTargetAndConventionalPath(t *testing.T) {
-	client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Scheme != "https" || request.URL.Host != "8.8.8.8:443" || request.URL.Path != "/cdn-cgi/trace" {
-			t.Fatalf("target request = %s %s", request.Method, request.URL)
-		}
-		if request.Header.Get("Authorization") != "" {
-			t.Fatal("backend credentials must never be sent to the target")
-		}
-		return &http.Response{
-			StatusCode: 404,
-			Status:     "404 Not Found",
-			Proto:      "HTTP/1.1",
-			Header:     http.Header{"Server": []string{"cloudflare"}},
-			Body:       io.NopCloser(strings.NewReader("fl=abc\nloc=US\n")),
-			Request:    request,
-		}, nil
-	})}
-	result, err := FetchCFTrace(context.Background(), "8.8.8.8", client)
+func TestFetchCFTraceUsesCurlOnIPAndConventionalPath(t *testing.T) {
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "curl.args")
+	t.Setenv("CURL_ARGS_FILE", argsPath)
+	curl := makeCurl(t, dir, "HTTP/2 404\r\nserver: cloudflare\r\n\r\nfl=abc\nloc=US\n", 0)
+	result, err := FetchCFTrace(context.Background(), "8.8.8.8", curl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,27 +35,27 @@ func TestFetchCFTraceUsesOnlyIPTargetAndConventionalPath(t *testing.T) {
 	if result.Body != "fl=abc\nloc=US\n" {
 		t.Fatalf("body = %q", result.Body)
 	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--silent", "--show-error", "--insecure", "--include", "--connect-timeout 1", "--max-time 1", "https://8.8.8.8:443/cdn-cgi/trace"} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("curl args %q do not contain %q", args, want)
+		}
+	}
+	if strings.Contains(string(args), "Authorization") || strings.Contains(string(args), "token") {
+		t.Fatalf("backend credentials appeared in curl args: %s", args)
+	}
 }
 
-func TestFetchCFTraceRejectsInvalidIP(t *testing.T) {
-	if _, err := FetchCFTrace(context.Background(), "not-an-ip", nil); err == nil {
+func TestFetchCFTraceRejectsInvalidIPAndCurlFailure(t *testing.T) {
+	if _, err := FetchCFTrace(context.Background(), "not-an-ip", "curl"); err == nil {
 		t.Fatal("FetchCFTrace() error = nil for invalid address")
 	}
-}
-
-func TestDefaultTargetHTTPTimeoutsAreOneSecond(t *testing.T) {
-	client := newTargetHTTPClient()
-	if client.Timeout != time.Second {
-		t.Errorf("HTTP client timeout = %s, want %s", client.Timeout, time.Second)
-	}
-	transport, ok := client.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("HTTP transport = %T, want *http.Transport", client.Transport)
-	}
-	if transport.TLSHandshakeTimeout != time.Second {
-		t.Errorf("TLS handshake timeout = %s, want %s", transport.TLSHandshakeTimeout, time.Second)
-	}
-	if transport.ResponseHeaderTimeout != time.Second {
-		t.Errorf("response-header timeout = %s, want %s", transport.ResponseHeaderTimeout, time.Second)
+	dir := t.TempDir()
+	curl := makeCurl(t, dir, "", 7)
+	if _, err := FetchCFTrace(context.Background(), "8.8.8.8", curl); err == nil {
+		t.Fatal("FetchCFTrace() error = nil when curl fails")
 	}
 }

@@ -2,10 +2,12 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,15 +43,6 @@ func makeExecutable(t *testing.T, dir, name, content string) string {
 	return path
 }
 
-func testBlocklist(t *testing.T, dir string) string {
-	t.Helper()
-	path := filepath.Join(dir, "blocklist.conf")
-	if err := os.WriteFile(path, []byte("192.0.2.0/24\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
 func baseBlock(cidr string) prefix.Block {
 	return prefix.Block{ASN: 64512, SourcePrefix: "8.8.8.0/23", BlockCIDR: cidr, Status: "active"}
 }
@@ -59,32 +52,69 @@ func response(server, body string) probe.TraceResponse {
 	return probe.TraceResponse{RawResponse: raw, Body: body}
 }
 
-func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) {
+func TestParseMasscanInteractiveLineAcceptsOnlyOpenTCP443InBlock(t *testing.T) {
+	block := baseBlock("8.8.8.0/24")
+	tests := []struct {
+		line string
+		want string
+	}{
+		{"Discovered open port 443/tcp on 8.8.8.10", "8.8.8.10"},
+		{"Discovered open port 80/tcp on 8.8.8.10", ""},
+		{"Discovered open port 443/udp on 8.8.8.10", ""},
+		{"Discovered closed port 443/tcp on 8.8.8.10", ""},
+		{"Discovered open port 443/tcp on 9.9.9.9", ""},
+		{"#masscan output", ""},
+		{"Discovered open port 443/tcp on not-an-ip", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.line, func(t *testing.T) {
+			got, ok := parseMasscanInteractiveOpen443(tt.line, block)
+			if tt.want == "" {
+				if ok {
+					t.Fatalf("parseMasscanInteractiveOpen443(%q) = %q, want no target", tt.line, got)
+				}
+				return
+			}
+			if !ok || got != tt.want {
+				t.Fatalf("parseMasscanInteractiveOpen443(%q) = (%q, %v), want (%q, true)", tt.line, got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunUsesMasscanThenConcurrentCurlValidation(t *testing.T) {
 	dir := t.TempDir()
-	zmapArgs := filepath.Join(dir, "zmap.args")
-	zgrabArgs := filepath.Join(dir, "zgrab.args")
-	t.Setenv("ZMAP_ARGS_FILE", zmapArgs)
-	t.Setenv("ZGRAB_ARGS_FILE", zgrabArgs)
-	makeExecutable(t, dir, "zmap", `
-  printf '%s\n' "$*" >> "$ZMAP_ARGS_FILE"
-  printf '8.8.8.10\n8.8.8.11\n8.8.8.12\n8.8.8.13\n'
-`)
-	makeExecutable(t, dir, "zgrab2", `
-  printf '%s\n' "$*" > "$ZGRAB_ARGS_FILE"
-  while IFS= read -r ip; do
-    case "$ip" in
-      8.8.8.10|8.8.8.11|8.8.8.12|8.8.8.13) printf '{"ip":"%s","data":{"tls":{"status":"success"}}}\n' "$ip" ;;
-    esac
-  done
-  printf 'not-json\n'
-`)
+	masscanArgs := filepath.Join(dir, "masscan.args")
+	t.Setenv("MASSCAN_ARGS_FILE", masscanArgs)
+	masscan := makeExecutable(t, dir, "masscan", fmt.Sprintf(`
+  printf '%%s\\n' "$*" > "$MASSCAN_ARGS_FILE"
+  cat <<'OUTPUT'
+Discovered open port 443/tcp on 8.8.8.10
+Discovered open port 443/tcp on 8.8.8.11
+Discovered open port 80/tcp on 8.8.8.12
+Discovered open port 443/tcp on 8.8.8.12
+Discovered open port 443/tcp on 8.8.8.13
+Discovered open port 443/tcp on 8.8.8.10
+Discovered open port 443/tcp on 9.9.9.9
+OUTPUT
+`))
+
 	collector := &reportCollector{}
-	var probed []string
+	var active, maxActive atomic.Int32
+	var callsMu sync.Mutex
+	calls := make(map[string]int)
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 17, Senders: 23, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(_ context.Context, ip string) (probe.TraceResponse, error) {
-			probed = append(probed, ip)
+			n := active.Add(1)
+			for previous := maxActive.Load(); n > previous && !maxActive.CompareAndSwap(previous, n); previous = maxActive.Load() {
+			}
+			time.Sleep(20 * time.Millisecond)
+			active.Add(-1)
+			callsMu.Lock()
+			calls[ip]++
+			callsMu.Unlock()
 			switch ip {
 			case "8.8.8.10":
 				return response("cloudflare", "fl=abc\nloc=US\nts=1\n"), nil
@@ -97,88 +127,94 @@ func TestRunUsesZMapRateAndZGrabSendersAndReportsOnlyValidCFTrace(t *testing.T) 
 			}
 		},
 	}
-	blocks := []prefix.Block{baseBlock("8.8.8.0/24")}
-	if err := runner.Run(context.Background(), 64512, blocks); err != nil {
+	if err := runner.Run(context.Background(), 64512, []prefix.Block{baseBlock("8.8.8.0/24")}); err != nil {
 		t.Fatal(err)
 	}
 
-	zmapData, err := os.ReadFile(zmapArgs)
+	args, err := os.ReadFile(masscanArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, argument := range []string{"-p 443", "-r 17", "--cooldown-time=1", "--output-module=csv", "--output-fields=saddr", "--output-filter=success = 1", "8.8.8.0/24"} {
-		if !strings.Contains(string(zmapData), argument) {
-			t.Errorf("ZMap args %q do not contain %q", zmapData, argument)
+	for _, argument := range []string{"--rate 17", "--wait 1", "-p 443", "--interactive", "--nostatus", "8.8.8.0/24"} {
+		if !strings.Contains(string(args), argument) {
+			t.Errorf("Masscan args %q do not contain %q", args, argument)
 		}
 	}
-	if strings.Contains(string(zmapData), "--no-header-row") {
-		t.Fatalf("ZMap args contain an unsupported option: %q", zmapData)
-	}
-	zgrabData, err := os.ReadFile(zgrabArgs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, argument := range []string{"tls", "--port 443", "--senders 23", "--connect-timeout 1s", "--target-timeout 1s", "--blocklist-file", filepath.Join(dir, "blocklist.conf")} {
-		if !strings.Contains(string(zgrabData), argument) {
-			t.Errorf("ZGrab2 args %q do not contain %q", zgrabData, argument)
+	for _, removed := range []string{"--output-flush", "-oL", "zmap", "zgrab2"} {
+		if strings.Contains(strings.ToLower(string(args)), removed) {
+			t.Errorf("scanner arguments still reference removed tool %q: %s", removed, args)
 		}
 	}
-	if len(probed) != 4 {
-		t.Fatalf("trace probe count = %d, want 4 (TLS-success JSON rows only)", len(probed))
+	if len(calls) != 4 {
+		t.Fatalf("curl validations = %v, want 4 unique open TCP/443 targets in the block", calls)
+	}
+	if calls["8.8.8.10"] != 1 || calls["8.8.8.11"] != 1 || calls["8.8.8.12"] != 1 || calls["8.8.8.13"] != 1 {
+		t.Fatalf("curl validation targets = %v", calls)
+	}
+	if got := maxActive.Load(); got != 2 {
+		t.Fatalf("maximum concurrent curl validations = %d, want 2", got)
 	}
 	reports := collector.snapshot()
-	if len(reports) != 3 || reports[0].Status != "active" || reports[1].Candidate == nil || reports[1].Candidate.Region != "US" || reports[2].Status != "completed" {
+	validCandidates := 0
+	for _, report := range reports {
+		if report.Candidate != nil {
+			validCandidates++
+			if report.Candidate.IP != "8.8.8.10" || report.Candidate.Region != "US" {
+				t.Fatalf("unexpected candidate report: %#v", report.Candidate)
+			}
+		}
+	}
+	if validCandidates != 1 || reports[0].Status != "active" || reports[len(reports)-1].Status != "completed" {
 		t.Fatalf("reports = %#v, want active, one valid candidate, completed", reports)
 	}
 }
 
 func TestRunScansBlocksInAscendingOrderAndSkipsCompletedBlocks(t *testing.T) {
 	dir := t.TempDir()
-	zmapArgs := filepath.Join(dir, "zmap.args")
-	t.Setenv("ZMAP_ARGS_FILE", zmapArgs)
-	makeExecutable(t, dir, "zmap", `printf '%s\n' "$*" >> "$ZMAP_ARGS_FILE"; exit 0`)
-	makeExecutable(t, dir, "zgrab2", `cat >/dev/null`)
+	masscanArgs := filepath.Join(dir, "masscan.args")
+	t.Setenv("MASSCAN_ARGS_FILE", masscanArgs)
+	masscan := makeExecutable(t, dir, "masscan", `printf '%s\n' "$*" >> "$MASSCAN_ARGS_FILE"`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 10, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
-			t.Fatal("no probe expected")
+			t.Fatal("no open targets expected")
 			return probe.TraceResponse{}, nil
 		},
 	}
 	blocks := []prefix.Block{
-		{SourcePrefix: "8.8.8.0/23", BlockCIDR: "8.8.9.0/24", Status: "active"},
-		{SourcePrefix: "8.8.8.0/23", BlockCIDR: "8.8.8.0/24", Status: "completed"},
+		{SourcePrefix: "8.8.8.0/22", BlockCIDR: "8.8.10.0/24", Status: "active"},
+		{SourcePrefix: "8.8.8.0/22", BlockCIDR: "8.8.8.0/24", Status: "active"},
+		{SourcePrefix: "8.8.8.0/22", BlockCIDR: "8.8.9.0/24", Status: "completed"},
 	}
 	if err := runner.Run(context.Background(), 64512, blocks); err != nil {
 		t.Fatal(err)
 	}
-	args, err := os.ReadFile(zmapArgs)
+	args, err := os.ReadFile(masscanArgs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.TrimSpace(string(args)); !strings.HasSuffix(got, "8.8.9.0/24") {
-		t.Fatalf("only pending block should be scanned, args = %q", got)
+	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], "8.8.8.0/24") || !strings.HasSuffix(lines[1], "8.8.10.0/24") {
+		t.Fatalf("Masscan block order = %q, want pending 8.8.8.0/24 then 8.8.10.0/24", lines)
 	}
 	reports := collector.snapshot()
-	if len(reports) != 2 || reports[0].BlockCIDR != "8.8.9.0/24" || reports[1].Status != "completed" {
+	if len(reports) != 4 || reports[0].BlockCIDR != "8.8.8.0/24" || reports[2].BlockCIDR != "8.8.10.0/24" || reports[3].Status != "completed" {
 		t.Fatalf("reports = %#v", reports)
 	}
 }
 
-func TestHeartbeatReportsActiveBlockDuringLongScan(t *testing.T) {
+func TestHeartbeatReportsLatestOpenPortDuringLongMasscanRun(t *testing.T) {
 	dir := t.TempDir()
 	started := filepath.Join(dir, "started")
-	makeExecutable(t, dir, "zmap", `printf '8.8.8.10\n'; touch "$STARTED_FILE"`)
-	makeExecutable(t, dir, "zgrab2", `while IFS= read -r ip; do printf '{"ip":"%s","data":{"tls":{"status":"failure"}}}\n' "$ip"; sleep 0.18; done`)
+	masscan := makeExecutable(t, dir, "masscan", `printf 'Discovered open port 443/tcp on 8.8.8.10\n'; touch "$STARTED_FILE"; sleep 0.18`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: 20 * time.Millisecond},
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 2, HeartbeatInterval: 20 * time.Millisecond},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
-			t.Fatal("TLS failure must not probe HTTPS")
-			return probe.TraceResponse{}, nil
+			return probe.TraceResponse{}, fmt.Errorf("curl failed")
 		},
 	}
 	t.Setenv("STARTED_FILE", started)
@@ -186,35 +222,28 @@ func TestHeartbeatReportsActiveBlockDuringLongScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	activeReports := 0
+	foundLatest := false
 	for _, report := range collector.snapshot() {
 		if report.Status == "active" && report.Candidate == nil {
 			activeReports++
+			if report.LatestIP == "8.8.8.10" {
+				foundLatest = true
+			}
 		}
 	}
-	if activeReports < 2 {
-		t.Fatalf("active progress reports = %d, want start plus heartbeat", activeReports)
-	}
-	foundLatest := false
-	for _, report := range collector.snapshot() {
-		if report.Status == "active" && report.Candidate == nil && report.LatestIP == "8.8.8.10" {
-			foundLatest = true
-		}
-	}
-	if !foundLatest {
-		t.Fatal("heartbeat did not report the latest failed TLS target IP")
+	if activeReports < 2 || !foundLatest {
+		t.Fatalf("active progress reports = %d, latest open IP reported = %v", activeReports, foundLatest)
 	}
 }
 
-func TestCancellationLeavesActiveBlockIncomplete(t *testing.T) {
+func TestCancellationLeavesActiveMasscanBlockIncomplete(t *testing.T) {
 	dir := t.TempDir()
 	started := filepath.Join(dir, "started")
-	makeExecutable(t, dir, "zmap", `touch "$STARTED_FILE"; sleep 30`)
-	makeExecutable(t, dir, "zgrab2", `cat >/dev/null`)
+	masscan := makeExecutable(t, dir, "masscan", `touch "$STARTED_FILE"; sleep 30`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:     RunnerConfig{ZMapPath: filepath.Join(dir, "zmap"), ZGrab2Path: filepath.Join(dir, "zgrab2"), BlocklistPath: testBlocklist(t, dir), Limit: 100, Senders: 10, HeartbeatInterval: time.Hour},
-		Reporter:   collector,
-		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) { return probe.TraceResponse{}, nil },
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 2, HeartbeatInterval: time.Hour},
+		Reporter: collector,
 	}
 	t.Setenv("STARTED_FILE", started)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,7 +256,7 @@ func TestCancellationLeavesActiveBlockIncomplete(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatal("ZMap fake did not start")
+			t.Fatal("Masscan fake did not start")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -237,20 +266,7 @@ func TestCancellationLeavesActiveBlockIncomplete(t *testing.T) {
 	}
 	for _, report := range collector.snapshot() {
 		if report.Status == "completed" {
-			t.Fatal("cancelled scan marked its active block complete")
+			t.Fatal("cancelled scan marked its active block completed")
 		}
-	}
-}
-
-func TestValidateBlocklistFileRejectsMissingAndEmptyFiles(t *testing.T) {
-	if err := ValidateBlocklistFile(filepath.Join(t.TempDir(), "missing.conf")); err == nil {
-		t.Fatal("ValidateBlocklistFile accepted a missing blocklist")
-	}
-	empty := filepath.Join(t.TempDir(), "empty.conf")
-	if err := os.WriteFile(empty, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := ValidateBlocklistFile(empty); err == nil {
-		t.Fatal("ValidateBlocklistFile accepted an empty blocklist")
 	}
 }
