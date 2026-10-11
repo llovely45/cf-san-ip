@@ -63,7 +63,7 @@ sudo cf-san run --config /etc/cf-san/config.json
 Both endpoints require `Authorization: Bearer <API_TOKEN>`:
 
 - `GET /api/agent/v1/plan?asn=906` fetches the live authorized ASN prefix set and returns that complete set, the legacy compact cursor, and per-block checkpoints; it does not materialize the scan plan itself.
-- `POST /api/agent/v1/claim` submits up to 64 ordered candidate blocks and acquires up to four exclusive, expiring leases.
+- `POST /api/agent/v1/claim` submits up to 64 ordered candidate blocks with an idempotency request ID and acquires up to four exclusive, expiring leases; the Worker enforces the four-lease cap across concurrent requests from the same Agent ID.
 - `POST /api/agent/v1/report` sends a lease-bound block heartbeat/completion, optionally with one validated candidate. Each checkpoint renews the lease; candidate persistence and checkpoint update are batched together in D1.
 - `POST /api/agent/v1/release` releases a lease when an agent pauses or exits a block early.
 

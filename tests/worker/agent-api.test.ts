@@ -50,7 +50,13 @@ async function claimLease(
   const response = await request(routes, "/claim", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ asn, agentId, maxBlocks: 1, blocks: [{ sourcePrefix, blockCidr }] }),
+    body: JSON.stringify({
+      asn,
+      agentId,
+      requestId: crypto.randomUUID().replaceAll("-", ""),
+      maxBlocks: 1,
+      blocks: [{ sourcePrefix, blockCidr }],
+    }),
   });
   if (response.status !== 200) {
     throw new Error(`lease claim failed with HTTP ${response.status}`);
@@ -175,6 +181,7 @@ describe("agent plan and report API", () => {
       body: JSON.stringify({
         asn,
         agentId,
+        requestId: crypto.randomUUID().replaceAll("-", ""),
         maxBlocks: 1,
         blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
       }),
@@ -220,6 +227,7 @@ describe("agent plan and report API", () => {
       body: JSON.stringify({
         asn,
         agentId,
+        requestId: crypto.randomUUID().replaceAll("-", ""),
         maxBlocks: 1,
         blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
       }),
@@ -243,6 +251,7 @@ describe("agent plan and report API", () => {
         body: JSON.stringify({
           asn,
           agentId,
+          requestId: crypto.randomUUID().replaceAll("-", ""),
           maxBlocks,
           blocks: ["8.8.0.0/16", "8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"].map((blockCidr) => ({
             sourcePrefix: "8.8.0.0/14",
@@ -268,6 +277,79 @@ describe("agent plan and report API", () => {
     const waiting = await claimNext("machine-c", 4);
     expect(waiting.results.every((item) => item.state === "leased")).toBe(true);
     expect(waiting.examined).toBe(4);
+  });
+
+  it("enforces four active leases per agent across concurrent claim requests", async () => {
+    const routes = makeRoutes(["8.8.0.0/13"]);
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = (blocks: string[]) => request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId: "single-machine",
+        requestId: crypto.randomUUID().replaceAll("-", ""),
+        maxBlocks: 4,
+        blocks: blocks.map((blockCidr) => ({ sourcePrefix: "8.8.0.0/13", blockCidr })),
+      }),
+    });
+    const [left, right] = await Promise.all([
+      claim(["8.8.0.0/16", "8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"]),
+      claim(["8.12.0.0/16", "8.13.0.0/16", "8.14.0.0/16", "8.15.0.0/16"]),
+    ]);
+    expect(left?.status).toBe(200);
+    expect(right?.status).toBe(200);
+
+    const count = await db.prepare(
+      `SELECT COUNT(*) AS count FROM scan_block_progress
+       WHERE lease_agent_id = 'single-machine' AND lease_expires_at > CURRENT_TIMESTAMP`,
+    ).first<{ count: number }>();
+    expect(count?.count).toBe(4);
+  });
+
+  it("recovers the same lease when an identical claim request is retried", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const requestId = "retry-claim-request-0001";
+    const claim = () => request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId: "machine-a",
+        requestId,
+        maxBlocks: 1,
+        blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
+      }),
+    });
+    const first = (await (await claim()).json() as { results: Array<{ leaseId: string }> }).results[0];
+    const retry = (await (await claim()).json() as { results: Array<{ state: string; leaseId: string }> }).results[0];
+    expect(retry).toMatchObject({ state: "claimed", leaseId: first?.leaseId });
+    expect(await db.prepare("SELECT COUNT(*) AS count FROM scan_block_progress WHERE asn = ?")
+      .bind(asn).first()).toEqual({ count: 1 });
+  });
+
+  it("rejects non-plan blocks, overlapping source prefixes, and unsorted claim batches", async () => {
+    const routes = makeRoutes(["8.8.0.0/14", "8.8.0.0/15"]);
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = (sourcePrefix: string, blocks: string[]) => request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId: "machine-a",
+        requestId: crypto.randomUUID().replaceAll("-", ""),
+        maxBlocks: 4,
+        blocks: blocks.map((blockCidr) => ({ sourcePrefix, blockCidr })),
+      }),
+    });
+
+    const legacySized = await claim("8.8.0.0/14", ["8.8.0.0/24"]);
+    expect(legacySized.status).toBe(400);
+    const overlappingSource = await claim("8.8.0.0/15", ["8.8.0.0/16"]);
+    expect(overlappingSource.status).toBe(400);
+    const outOfOrder = await claim("8.8.0.0/14", ["8.9.0.0/16", "8.8.0.0/16"]);
+    expect(outOfOrder.status).toBe(400);
   });
 
   it("renews lease on checkpoint reports and rejects stale owners", async () => {
@@ -314,6 +396,7 @@ describe("agent plan and report API", () => {
       body: JSON.stringify({
         asn,
         agentId,
+        requestId: crypto.randomUUID().replaceAll("-", ""),
         maxBlocks: 1,
         blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
       }),

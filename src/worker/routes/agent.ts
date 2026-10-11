@@ -1,13 +1,22 @@
 import { Hono } from "hono";
 
-import { isIPv4ScanBlock, isIPv4WithinCIDR, normalizeIPv4Prefixes } from "../../shared/ipv4-prefixes";
+import {
+  areIPv4ScanBlocksAscending,
+  getIPv4ScanPlanSources,
+  isIPv4PlannedScanBlock,
+  isIPv4ScanBlock,
+  isIPv4WithinCIDR,
+  normalizeIPv4Prefixes,
+} from "../../shared/ipv4-prefixes";
 import { validateIpInput } from "../../shared/ip";
 import type { Env } from "../env";
 import { apiTokenMiddleware, createApiTokenMiddleware } from "../middleware/api-token";
 import type { ScanBlockStatus } from "../repositories/scan-blocks";
 import {
   D1ScanCheckpointRepository,
+  MAX_SCAN_BLOCK_LEASES_PER_AGENT,
   SCAN_BLOCK_LEASE_TIMEOUT_SECONDS,
+  type ScanBlockClaim,
   type ScanBlockLease,
   type ScanProgress,
 } from "../repositories/scan-checkpoints";
@@ -16,7 +25,6 @@ import { fetchOriginatingIPv4Prefixes } from "../services/ripe-prefixes";
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const MAX_AGENT_BLOCK_LEASES = 4;
 const MAX_CLAIM_CANDIDATES = 64;
 
 function parseAsn(value: string | null): number | null {
@@ -37,6 +45,10 @@ function parseAgentId(value: unknown): string | null {
 
 function parseLeaseId(value: unknown): string | null {
   return typeof value === "string" && value.length >= 16 && value.length <= 128 ? value : null;
+}
+
+function parseClaimRequestId(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{16,128}$/u.test(value) ? value : null;
 }
 
 function parseLeaseInput(input: Record<string, unknown>): Omit<ScanBlockLease, "leaseId"> | null {
@@ -115,13 +127,15 @@ export function createAgentRoutes(
     }
     const asn = input.asn;
     const agentId = parseAgentId(input.agentId);
+    const requestId = parseClaimRequestId(input.requestId);
     const maxBlocks = input.maxBlocks;
     const candidates = input.blocks;
     if (
       typeof asn !== "number" || !Number.isSafeInteger(asn) || asn <= 0 ||
       agentId === null ||
+      requestId === null ||
       typeof maxBlocks !== "number" || !Number.isSafeInteger(maxBlocks) ||
-      maxBlocks < 1 || maxBlocks > MAX_AGENT_BLOCK_LEASES ||
+      maxBlocks < 1 || maxBlocks > MAX_SCAN_BLOCK_LEASES_PER_AGENT ||
       !Array.isArray(candidates) || candidates.length < 1 || candidates.length > MAX_CLAIM_CANDIDATES
     ) {
       return context.json({ error: "invalid_lease_request" }, 400);
@@ -132,15 +146,16 @@ export function createAgentRoutes(
     if (currentPrefixes === null) {
       return context.json({ error: "scan_plan_not_initialized" }, 409);
     }
-    const currentPrefixSet = new Set(currentPrefixes);
+    const currentPrefixSet = new Set(getIPv4ScanPlanSources(currentPrefixes));
     const seen = new Set<string>();
+    const seenBlocks = new Set<string>();
     const parsedCandidates: Array<{ sourcePrefix: string; blockCidr: string }> = [];
     for (const candidate of candidates) {
       if (
         !isObject(candidate) ||
         typeof candidate.sourcePrefix !== "string" ||
         typeof candidate.blockCidr !== "string" ||
-        !isIPv4ScanBlock(candidate.sourcePrefix, candidate.blockCidr) ||
+        !isIPv4PlannedScanBlock(candidate.sourcePrefix, candidate.blockCidr) ||
         !currentPrefixSet.has(candidate.sourcePrefix)
       ) {
         return context.json({ error: "invalid_lease_candidate" }, 400);
@@ -149,8 +164,15 @@ export function createAgentRoutes(
       if (seen.has(key)) {
         return context.json({ error: "duplicate_lease_candidate" }, 400);
       }
+      if (seenBlocks.has(candidate.blockCidr)) {
+        return context.json({ error: "duplicate_lease_candidate" }, 400);
+      }
       seen.add(key);
+      seenBlocks.add(candidate.blockCidr);
       parsedCandidates.push({ sourcePrefix: candidate.sourcePrefix, blockCidr: candidate.blockCidr });
+    }
+    if (!areIPv4ScanBlocksAscending(parsedCandidates.map((candidate) => candidate.blockCidr))) {
+      return context.json({ error: "lease_candidates_not_ascending" }, 400);
     }
 
     const results: Array<{
@@ -163,15 +185,30 @@ export function createAgentRoutes(
     let claimedCount = 0;
     for (const candidate of parsedCandidates) {
       const base = { asn, ...candidate };
-      const lease: ScanBlockLease = { ...base, agentId, leaseId: crypto.randomUUID() };
-      if (await repository.claimBlock(lease)) {
+      const lease: ScanBlockClaim = {
+        ...base,
+        agentId,
+        leaseId: crypto.randomUUID(),
+        requestId,
+      };
+      const existingLeaseId = await repository.getLeaseForRequest(lease);
+      if (existingLeaseId !== null) {
+        results.push({ ...base, state: "claimed", leaseId: existingLeaseId });
+        claimedCount++;
+      } else if (await repository.claimBlock(lease)) {
         results.push({ ...base, state: "claimed", leaseId: lease.leaseId });
         claimedCount++;
       } else {
-        const completed = await repository.isBlockCompleted(asn, candidate.sourcePrefix, candidate.blockCidr);
-        results.push({ ...base, state: completed ? "completed" : "leased" });
+        const recoveredLeaseId = await repository.getLeaseForRequest(lease);
+        if (recoveredLeaseId !== null) {
+          results.push({ ...base, state: "claimed", leaseId: recoveredLeaseId });
+          claimedCount++;
+        } else {
+          const completed = await repository.isBlockCompleted(asn, candidate.sourcePrefix, candidate.blockCidr);
+          results.push({ ...base, state: completed ? "completed" : "leased" });
+        }
       }
-      if (claimedCount >= maxBlocks) {
+      if (claimedCount >= Math.min(maxBlocks, MAX_SCAN_BLOCK_LEASES_PER_AGENT)) {
         break;
       }
     }

@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,7 @@ type claimCandidate struct {
 type claimNextRequest struct {
 	ASN       uint32           `json:"asn"`
 	AgentID   string           `json:"agentId"`
+	RequestID string           `json:"requestId"`
 	MaxBlocks uint32           `json:"maxBlocks"`
 	Blocks    []claimCandidate `json:"blocks"`
 }
@@ -189,13 +192,30 @@ func (c *Client) ClaimBlocks(
 		}
 		claimCandidates[index] = claimCandidate{SourcePrefix: candidate.SourcePrefix, BlockCIDR: candidate.BlockCIDR}
 	}
+	requestID, err := newClaimRequestID()
+	if err != nil {
+		return nil, 0, errors.New("cannot create scan block claim request ID")
+	}
 	body, err := json.Marshal(claimNextRequest{
-		ASN: asn, AgentID: c.agentID, MaxBlocks: maxBlocks, Blocks: claimCandidates,
+		ASN: asn, AgentID: c.agentID, RequestID: requestID, MaxBlocks: maxBlocks, Blocks: claimCandidates,
 	})
 	if err != nil {
 		return nil, 0, errors.New("cannot encode scan block claim")
 	}
-	response, err := c.request(ctx, http.MethodPost, c.baseURL+"/api/agent/v1/claim", body)
+	var response []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err = c.request(ctx, http.MethodPost, c.baseURL+"/api/agent/v1/claim", body)
+		if err == nil || !isRetryableClaimError(err) || attempt == 1 {
+			break
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
 	if err != nil {
 		return nil, 0, err
 	}
@@ -232,6 +252,21 @@ func (c *Client) ClaimBlocks(
 		return nil, 0, errors.New("backend claimed more blocks than requested")
 	}
 	return claims, result.Examined, nil
+}
+
+func newClaimRequestID() (string, error) {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes[:]), nil
+}
+
+func isRetryableClaimError(err error) bool {
+	message := err.Error()
+	return strings.HasPrefix(message, "backend request failed:") ||
+		message == "cannot read backend response" ||
+		strings.HasPrefix(message, "backend returned HTTP 5")
 }
 
 func (c *Client) ReleaseBlock(ctx context.Context, block prefix.Block, leaseID string) error {

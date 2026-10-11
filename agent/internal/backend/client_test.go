@@ -253,6 +253,7 @@ func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T
 		Path          string           `json:"-"`
 		Authorization string           `json:"-"`
 		AgentID       string           `json:"agentId"`
+		RequestID     string           `json:"requestId"`
 		LeaseID       string           `json:"leaseId"`
 		ASN           uint32           `json:"asn"`
 		SourcePrefix  string           `json:"sourcePrefix"`
@@ -263,6 +264,7 @@ func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			AgentID      string           `json:"agentId"`
+			RequestID    string           `json:"requestId"`
 			LeaseID      string           `json:"leaseId"`
 			ASN          uint32           `json:"asn"`
 			SourcePrefix string           `json:"sourcePrefix"`
@@ -277,13 +279,14 @@ func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T
 			Path          string           `json:"-"`
 			Authorization string           `json:"-"`
 			AgentID       string           `json:"agentId"`
+			RequestID     string           `json:"requestId"`
 			LeaseID       string           `json:"leaseId"`
 			ASN           uint32           `json:"asn"`
 			SourcePrefix  string           `json:"sourcePrefix"`
 			BlockCIDR     string           `json:"blockCidr"`
 			MaxBlocks     uint32           `json:"maxBlocks"`
 			Blocks        []claimCandidate `json:"blocks"`
-		}{r.URL.Path, r.Header.Get("Authorization"), body.AgentID, body.LeaseID, body.ASN, body.SourcePrefix, body.BlockCIDR, body.MaxBlocks, body.Blocks})
+		}{r.URL.Path, r.Header.Get("Authorization"), body.AgentID, body.RequestID, body.LeaseID, body.ASN, body.SourcePrefix, body.BlockCIDR, body.MaxBlocks, body.Blocks})
 		if r.URL.Path == "/api/agent/v1/claim" {
 			fmt.Fprint(w, `{"results":[{"sourcePrefix":"8.8.8.0/24","blockCidr":"8.8.8.0/24","state":"claimed","leaseId":"lease-token-1234567890"}],"examined":1}`)
 			return
@@ -309,6 +312,9 @@ func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T
 	if requests[0].MaxBlocks != 4 {
 		t.Errorf("requested maxBlocks = %d, want 4", requests[0].MaxBlocks)
 	}
+	if len(requests[0].RequestID) != 32 {
+		t.Errorf("claim request ID = %q, want a 32-character random id", requests[0].RequestID)
+	}
 	if len(requests[0].Blocks) != 1 || requests[0].Blocks[0] != (claimCandidate{SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR}) {
 		t.Errorf("claim candidates = %#v", requests[0].Blocks)
 	}
@@ -319,6 +325,40 @@ func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T
 	}
 	if requests[1].LeaseID != claims[0].Block.LeaseID || requests[1].SourcePrefix != block.SourcePrefix || requests[1].BlockCIDR != block.BlockCIDR {
 		t.Errorf("release request = %#v", requests[1])
+	}
+}
+
+func TestClaimRetriesWithTheSameIdempotencyKey(t *testing.T) {
+	var requestID string
+	attempts := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			RequestID string `json:"requestId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode claim request: %v", err)
+		}
+		attempts++
+		if attempts == 1 {
+			requestID = body.RequestID
+			// Model a committed claim whose response is lost at the HTTP boundary.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if body.RequestID != requestID {
+			t.Errorf("retry request ID = %q, want same id %q", body.RequestID, requestID)
+		}
+		fmt.Fprint(w, `{"results":[{"sourcePrefix":"8.8.8.0/24","blockCidr":"8.8.8.0/24","state":"claimed","leaseId":"lease-token-1234567890"}],"examined":1}`)
+	}))
+	defer server.Close()
+	client, err := newClientWithAgentID(server.URL, "token", "machine-a", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := prefix.Block{ASN: 64512, SourcePrefix: "8.8.8.0/24", BlockCIDR: "8.8.8.0/24"}
+	claims, examined, err := client.ClaimBlocks(context.Background(), block.ASN, []prefix.Block{block}, 1)
+	if err != nil || examined != 1 || len(claims) != 1 || attempts != 2 {
+		t.Fatalf("ClaimBlocks() = (%#v, %d, %v), attempts=%d", claims, examined, err, attempts)
 	}
 }
 

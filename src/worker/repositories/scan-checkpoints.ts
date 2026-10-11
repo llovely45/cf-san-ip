@@ -25,9 +25,14 @@ export interface ScanBlockLease {
   leaseId: string;
 }
 
+export interface ScanBlockClaim extends ScanBlockLease {
+  requestId: string;
+}
+
 // The scanner force-syncs its latest checkpoint every 10 minutes. Keep a lease
 // for three missed sync intervals so a delayed request does not release work.
 export const SCAN_BLOCK_LEASE_TIMEOUT_SECONDS = 30 * 60;
+export const MAX_SCAN_BLOCK_LEASES_PER_AGENT = 4;
 
 interface ScanCheckpointRow {
   source_prefix: string;
@@ -148,21 +153,43 @@ export class D1ScanCheckpointRepository {
     return result !== null;
   }
 
-  async claimBlock(lease: ScanBlockLease): Promise<boolean> {
+  async getLeaseForRequest(lease: ScanBlockClaim): Promise<string | null> {
+    const row = await this.db.prepare(
+      `SELECT lease_id FROM scan_block_progress
+       WHERE asn = ? AND source_prefix = ? AND block_cidr = ?
+         AND lease_agent_id = ? AND lease_request_id = ?
+         AND lease_expires_at > CURRENT_TIMESTAMP AND status != 'completed'`,
+    ).bind(
+      lease.asn,
+      lease.sourcePrefix,
+      lease.blockCidr,
+      lease.agentId,
+      lease.requestId,
+    ).first<{ lease_id: string }>();
+    return row?.lease_id ?? null;
+  }
+
+  async claimBlock(lease: ScanBlockClaim): Promise<boolean> {
     const claimed = await this.db.prepare(
       `INSERT INTO scan_block_progress(
-         asn, source_prefix, block_cidr, status, lease_agent_id, lease_id, lease_expires_at
+         asn, source_prefix, block_cidr, status, lease_agent_id, lease_id,
+         lease_expires_at, lease_request_id
        )
-       SELECT ?, ?, ?, 'active', ?, ?, datetime('now', '+' || ? || ' seconds')
+       SELECT ?, ?, ?, 'active', ?, ?, datetime('now', '+' || ? || ' seconds'), ?
        WHERE NOT EXISTS (
          SELECT 1 FROM scan_checkpoints
          WHERE asn = ? AND source_prefix = ? AND block_cidr = ? AND status = 'completed'
        )
+         AND (
+           SELECT COUNT(*) FROM scan_block_progress
+           WHERE lease_agent_id = ? AND lease_expires_at > CURRENT_TIMESTAMP
+         ) < ?
        ON CONFLICT(asn, source_prefix, block_cidr) DO UPDATE SET
          status = 'active',
          lease_agent_id = excluded.lease_agent_id,
          lease_id = excluded.lease_id,
          lease_expires_at = excluded.lease_expires_at,
+         lease_request_id = excluded.lease_request_id,
          updated_at = CURRENT_TIMESTAMP
        WHERE scan_block_progress.status != 'completed'
          AND (
@@ -178,9 +205,12 @@ export class D1ScanCheckpointRepository {
       lease.agentId,
       lease.leaseId,
       SCAN_BLOCK_LEASE_TIMEOUT_SECONDS,
+      lease.requestId,
       lease.asn,
       lease.sourcePrefix,
       lease.blockCidr,
+      lease.agentId,
+      MAX_SCAN_BLOCK_LEASES_PER_AGENT,
     ).first<{ lease_id: string }>();
     return claimed?.lease_id === lease.leaseId;
   }
@@ -190,6 +220,7 @@ export class D1ScanCheckpointRepository {
       `UPDATE scan_block_progress
        SET lease_agent_id = NULL,
            lease_id = NULL,
+           lease_request_id = NULL,
            lease_expires_at = NULL,
            updated_at = CURRENT_TIMESTAMP
        WHERE asn = ? AND source_prefix = ? AND block_cidr = ?
@@ -212,6 +243,7 @@ export class D1ScanCheckpointRepository {
            status = ?,
            lease_agent_id = CASE WHEN ? = 1 THEN NULL ELSE lease_agent_id END,
            lease_id = CASE WHEN ? = 1 THEN NULL ELSE lease_id END,
+           lease_request_id = CASE WHEN ? = 1 THEN NULL ELSE lease_request_id END,
            lease_expires_at = CASE
              WHEN ? = 1 THEN NULL
              ELSE datetime('now', '+' || ? || ' seconds')
@@ -224,6 +256,7 @@ export class D1ScanCheckpointRepository {
     ).bind(
       progress.latestIp,
       progress.status,
+      completed ? 1 : 0,
       completed ? 1 : 0,
       completed ? 1 : 0,
       completed ? 1 : 0,
@@ -295,6 +328,7 @@ export class D1ScanCheckpointRepository {
          SET status = 'completed',
              lease_agent_id = NULL,
              lease_id = NULL,
+             lease_request_id = NULL,
              lease_expires_at = NULL,
              last_reported_at = CURRENT_TIMESTAMP,
              updated_at = CURRENT_TIMESTAMP
