@@ -3,6 +3,7 @@ package menu
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,7 +17,7 @@ import (
 func TestPrintStatusDisplaysConfiguredToken(t *testing.T) {
 	var output bytes.Buffer
 	app := &App{Output: &output, Manager: &Manager{RunDir: filepath.Join(t.TempDir(), "run")}}
-	cfg := config.Config{URL: "https://worker.example", Token: "visible-token", ASN: 16509, Limit: 250, CurlWorkers: 40, AgentID: "agent-1"}
+	cfg := config.Config{URL: "https://worker.example", Token: "visible-token", ASN: 16509, Limit: 250, CurlWorkers: 40, MasscanCPUPercent: 30, AgentID: "agent-1"}
 
 	app.printStatus(cfg)
 
@@ -25,6 +26,9 @@ func TestPrintStatusDisplaysConfiguredToken(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "并发扫描块上限：4") {
 		t.Fatalf("status output does not display the four-block concurrency limit: %q", output.String())
+	}
+	if !strings.Contains(output.String(), "Masscan 总 CPU 上限：30%") {
+		t.Fatalf("status output does not display the default total CPU cap: %q", output.String())
 	}
 }
 
@@ -38,7 +42,7 @@ func TestMenuShowsConfigurationAndUpdateChoices(t *testing.T) {
 	if err := app.Run(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"4. 设置 Masscan 发包速率（PPS）", "5. 设置 curl 验证并发数", "8. 修改后端地址", "9. 修改 API Token", "10. 更新 cf-san 到最新版本", "11. 查看扫描日志", "12. 退出"} {
+	for _, want := range []string{"4. 设置 Masscan 发包速率（PPS）", "5. 设置 curl 验证并发数", "6. 设置 Masscan 总 CPU 上限（%）", "9. 修改后端地址", "10. 修改 API Token", "11. 更新 cf-san 到最新版本", "12. 查看扫描日志", "13. 退出"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("menu output missing %q: %s", want, output.String())
 		}
@@ -47,14 +51,14 @@ func TestMenuShowsConfigurationAndUpdateChoices(t *testing.T) {
 
 func TestMenuUpdateChoiceRunsUpdaterAndPersistsConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	initial := config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, AgentID: "id"}
+	initial := config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "id"}
 	if err := config.Save(path, initial); err != nil {
 		t.Fatal(err)
 	}
 	var called bool
 	app := &App{
 		ConfigPath: path,
-		Input:      strings.NewReader("10\n12\n"),
+		Input:      strings.NewReader("11\n13\n"),
 		Output:     &bytes.Buffer{},
 		updateAgent: func(_ context.Context, cfg config.Config, _ io.Writer) error {
 			called = true
@@ -129,7 +133,7 @@ func TestMenuCanChangeBackendURLAndToken(t *testing.T) {
 	var output bytes.Buffer
 	app := &App{
 		ConfigPath: path,
-		Input:      strings.NewReader("8\nhttps://new-worker.example/\n9\nnew-token\n7\n12\n"),
+		Input:      strings.NewReader("9\nhttps://new-worker.example/\n10\nnew-token\n8\n13\n"),
 		Output:     &output,
 	}
 	if err := app.Run(); err != nil {
@@ -144,6 +148,36 @@ func TestMenuCanChangeBackendURLAndToken(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Token：new-token") {
 		t.Fatalf("updated token was not displayed by status: %s", output.String())
+	}
+}
+
+func TestMenuCanChangeMasscanTotalCPUPercent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Save(path, config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, AgentID: "id"}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	app := &App{
+		ConfigPath: path,
+		Input:      strings.NewReader("6\n45\n8\n13\n"),
+		Output:     &output,
+	}
+	if err := app.Run(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved["masscanCpuPercent"] != float64(45) {
+		t.Fatalf("saved masscan CPU cap = %#v, want 45", saved["masscanCpuPercent"])
+	}
+	if !strings.Contains(output.String(), "Masscan 总 CPU 上限：45%") {
+		t.Fatalf("menu did not display the updated total CPU cap: %s", output.String())
 	}
 }
 
@@ -165,13 +199,13 @@ func TestMenuDisplaysRecentLogsBeforeExit(t *testing.T) {
 	app := &App{
 		ConfigPath: path,
 		Manager:    manager,
-		Input:      strings.NewReader("11\n12\n"),
+		Input:      strings.NewReader("12\n13\n"),
 		Output:     &output,
 	}
 	if err := app.Run(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"11. 查看扫描日志", "12. 退出", "old line", "latest scanner error", logPath} {
+	for _, want := range []string{"12. 查看扫描日志", "13. 退出", "old line", "latest scanner error", logPath} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("menu output missing %q: %s", want, output.String())
 		}

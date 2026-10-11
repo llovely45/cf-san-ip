@@ -70,13 +70,14 @@ func (app *App) Run() error {
 		fmt.Fprintln(app.Output, "3. 暂停扫描")
 		fmt.Fprintln(app.Output, "4. 设置 Masscan 发包速率（PPS）")
 		fmt.Fprintln(app.Output, "5. 设置 curl 验证并发数")
-		fmt.Fprintln(app.Output, "6. 设置 ASN")
-		fmt.Fprintln(app.Output, "7. 查看配置与状态")
-		fmt.Fprintln(app.Output, "8. 修改后端地址")
-		fmt.Fprintln(app.Output, "9. 修改 API Token")
-		fmt.Fprintln(app.Output, "10. 更新 cf-san 到最新版本")
-		fmt.Fprintln(app.Output, "11. 查看扫描日志（最近 100 行）")
-		fmt.Fprintln(app.Output, "12. 退出")
+		fmt.Fprintln(app.Output, "6. 设置 Masscan 总 CPU 上限（%）")
+		fmt.Fprintln(app.Output, "7. 设置 ASN")
+		fmt.Fprintln(app.Output, "8. 查看配置与状态")
+		fmt.Fprintln(app.Output, "9. 修改后端地址")
+		fmt.Fprintln(app.Output, "10. 修改 API Token")
+		fmt.Fprintln(app.Output, "11. 更新 cf-san 到最新版本")
+		fmt.Fprintln(app.Output, "12. 查看扫描日志（最近 100 行）")
+		fmt.Fprintln(app.Output, "13. 退出")
 		choice, err := readLine(reader, app.Output, "请选择：")
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -101,24 +102,24 @@ func (app *App) Run() error {
 			} else {
 				fmt.Fprintln(app.Output, "已发送安全暂停信号；当前块会在下次运行时重扫。")
 			}
-		case "4", "5", "6", "8", "9":
+		case "4", "5", "6", "7", "9", "10":
 			if err := app.updateSetting(reader, &cfg, choice); err != nil {
 				fmt.Fprintf(app.Output, "设置失败：%v\n", err)
 			}
-		case "7":
+		case "8":
 			app.printStatus(cfg)
-		case "10":
+		case "11":
 			if err := app.updateLatest(&cfg); err != nil {
 				fmt.Fprintf(app.Output, "更新失败：%v\n", err)
 			} else {
 				fmt.Fprintln(app.Output, "更新完成；请退出菜单后重新运行 cf-san，以加载新版本。")
 			}
-		case "11":
-			app.showLogs()
 		case "12":
+			app.showLogs()
+		case "13":
 			return nil
 		default:
-			fmt.Fprintln(app.Output, "无效选项，请输入 1–12。")
+			fmt.Fprintln(app.Output, "无效选项，请输入 1–13。")
 		}
 	}
 }
@@ -182,6 +183,9 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if _, err := exec.LookPath("curl"); err != nil {
 		return errors.New("未找到 curl；请运行 cf-san 安装脚本")
 	}
+	if _, err := exec.LookPath("cpulimit"); err != nil {
+		return errors.New("未找到 cpulimit；请运行 cf-san 安装脚本以启用 Masscan CPU 上限")
+	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
 	}
@@ -206,6 +210,9 @@ func (app *App) start(cfg *config.Config) error {
 	}
 	if _, err := exec.LookPath("curl"); err != nil {
 		return errors.New("未找到 curl；请先选择菜单 1 初始化环境")
+	}
+	if _, err := exec.LookPath("cpulimit"); err != nil {
+		return errors.New("未找到 cpulimit；请先选择菜单 1 初始化环境")
 	}
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
@@ -242,10 +249,12 @@ func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice s
 	case "5":
 		key, prompt = "workers", "新的 curl 验证并发数："
 	case "6":
+		key, prompt = "cpu", "Masscan 总 CPU 上限（1–100，占本机可见 CPU 总量百分比）："
+	case "7":
 		key, prompt = "asn", "新的 ASN："
-	case "8":
-		key, prompt = "url", "新的 Worker HTTPS 地址："
 	case "9":
+		key, prompt = "url", "新的 Worker HTTPS 地址："
+	case "10":
 		key, prompt = "token", "新的 API Token（明文保存）："
 	}
 	value, err := readLine(reader, app.Output, prompt)
@@ -273,8 +282,8 @@ func (app *App) printStatus(cfg config.Config) {
 	if cfg.Token != "" {
 		tokenState = cfg.Token
 	}
-	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nMasscan PPS 上限：%d\ncurl 验证并发：%d\n并发扫描块上限：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
-		cfg.URL, cfg.ASN, cfg.Limit, cfg.CurlWorkers, scanner.MaxConcurrentBlocks, tokenState, cfg.AgentID, state)
+	fmt.Fprintf(app.Output, "后端：%s\nASN：%d\nMasscan PPS 上限：%d\nMasscan 总 CPU 上限：%d%%\ncurl 验证并发：%d\n并发扫描块上限：%d\nToken：%s\nAgent ID：%s\n扫描状态：%s\n",
+		cfg.URL, cfg.ASN, cfg.Limit, cfg.MasscanCPUPercent, cfg.CurlWorkers, scanner.MaxConcurrentBlocks, tokenState, cfg.AgentID, state)
 }
 
 func UpdateSetting(cfg *config.Config, key, raw string) error {
@@ -298,6 +307,12 @@ func UpdateSetting(cfg *config.Config, key, raw string) error {
 			return errors.New("curl 验证并发数必须是 1 到 4096 之间的整数")
 		}
 		cfg.CurlWorkers = uint32(parsed)
+	case "cpu":
+		parsed, err := strconv.ParseUint(value, 10, 32)
+		if err != nil || parsed == 0 || parsed > 100 {
+			return errors.New("Masscan 总 CPU 上限必须是 1 到 100 之间的整数")
+		}
+		cfg.MasscanCPUPercent = uint32(parsed)
 	case "url":
 		if err := config.ValidateBackendURL(value); err != nil {
 			return err

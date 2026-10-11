@@ -51,6 +51,14 @@ MASSCAN
   chmod +x "$STUB_DIR/masscan"
   ;;
 esac
+case "$*" in *cpulimit*)
+  cat > "$STUB_DIR/cpulimit" <<'CPULIMIT'
+#!/bin/sh
+exit 0
+CPULIMIT
+  chmod +x "$STUB_DIR/cpulimit"
+  ;;
+esac
 STUB
 cat > "$STUB_DIR/apt-cache" <<'STUB'
 #!/bin/sh
@@ -72,6 +80,14 @@ case "$*" in *masscan*)
 exit 0
 MASSCAN
   chmod +x "$STUB_DIR/masscan"
+  ;;
+esac
+case "$*" in *cpulimit*)
+  cat > "$STUB_DIR/cpulimit" <<'CPULIMIT'
+#!/bin/sh
+exit 0
+CPULIMIT
+  chmod +x "$STUB_DIR/cpulimit"
   ;;
 esac
 STUB
@@ -136,6 +152,7 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   case "$install_output" in *installer-test-secret*) echo 'installer echoed token' >&2; exit 1 ;; esac
   [ -x /usr/local/bin/cf-san ] || { echo 'cf-san was not installed' >&2; exit 1; }
   command -v masscan >/dev/null 2>&1 || { echo 'masscan was not installed' >&2; exit 1; }
+  command -v cpulimit >/dev/null 2>&1 || { echo 'cpulimit was not installed' >&2; exit 1; }
   [ ! -e /usr/local/bin/zgrab2 ] || { echo 'legacy zgrab2 binary was not removed' >&2; exit 1; }
   [ ! -e /usr/local/share/cf-san/zgrab2-blocklist.conf ] || { echo 'legacy bundled blocklist was not removed' >&2; exit 1; }
   [ "$(stat -c '%a' /etc/cf-san/config.json)" = 600 ] || { echo 'config permissions are not 0600' >&2; exit 1; }
@@ -146,15 +163,19 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
       grep -q '^apt-get update$' "$PACKAGE_LOG"
       grep -q 'apt-get install -y .*masscan' "$PACKAGE_LOG"
       grep -q "apt-get install -y .*${MOCK_PCAP_PACKAGE}" "$PACKAGE_LOG"
+      grep -q 'apt-get install -y .*cpulimit' "$PACKAGE_LOG"
       ;;
-    alpine) grep -q '^apk add --no-cache .*masscan' "$PACKAGE_LOG" ;;
+    alpine)
+      grep -q '^apk add --no-cache .*masscan' "$PACKAGE_LOG"
+      grep -q '^apk add --no-cache .*cpulimit' "$PACKAGE_LOG"
+      ;;
     *) echo "unexpected container OS: ${ID:-unset}" >&2; exit 1 ;;
   esac
   if grep -q 'zmap' "$PACKAGE_LOG"; then echo 'installer still installs ZMap' >&2; exit 1; fi
 
   /usr/local/bin/cf-san configure --url 'https://worker.example' --token 'old-token' --asn 16509 --limit 250 --workers 40
   : > "$PACKAGE_LOG"
-  rm -f "$STUB_DIR/masscan"
+  rm -f "$STUB_DIR/masscan" "$STUB_DIR/cpulimit"
   update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
     CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
       printf '%s\n' "$update_output" >&2
@@ -162,13 +183,17 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
     }
   case "$update_output" in *updated-token*) echo 'update installer echoed the API token' >&2; exit 1 ;; esac
   command -v masscan >/dev/null 2>&1 || { echo 'update-only did not install missing masscan' >&2; exit 1; }
+  command -v cpulimit >/dev/null 2>&1 || { echo 'update-only did not install missing cpulimit' >&2; exit 1; }
   case "${ID:-}" in
     debian)
       grep -q '^apt-get update$' "$PACKAGE_LOG"
       grep -q 'apt-get install -y masscan' "$PACKAGE_LOG"
       grep -q "apt-get install -y .*${MOCK_PCAP_PACKAGE}" "$PACKAGE_LOG"
+      grep -q 'apt-get install -y .*cpulimit' "$PACKAGE_LOG"
       ;;
-    alpine) grep -q '^apk add --no-cache masscan$' "$PACKAGE_LOG" ;;
+    alpine)
+      grep -q '^apk add --no-cache masscan cpulimit$' "$PACKAGE_LOG"
+      ;;
   esac
   grep -q '"url": "https://updated.example"' /etc/cf-san/config.json || { echo 'update did not save the new backend URL' >&2; exit 1; }
   grep -q '"token": "updated-token"' /etc/cf-san/config.json || { echo 'update did not save the new API token' >&2; exit 1; }

@@ -96,6 +96,7 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	limitValue := flags.Uint64("limit", 0, "Aggregate Masscan packets-per-second cap")
 	workersValue := flags.Uint("workers", 0, "Concurrent curl validations")
 	sendersValue := flags.Uint("senders", 0, "Deprecated alias for --workers")
+	cpuPercentValue := flags.Uint("cpu-percent", 0, "Aggregate Masscan CPU limit as percent of visible logical CPUs")
 	configPath := flags.String("config", "", "local configuration path")
 	if err := flags.Parse(arguments); err != nil {
 		return cliOptions{}, err
@@ -107,6 +108,7 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	limitWasSet := false
 	workersWasSet := false
 	sendersWasSet := false
+	cpuPercentWasSet := false
 	flags.Visit(func(item *flag.Flag) {
 		switch item.Name {
 		case "limit":
@@ -115,6 +117,8 @@ func parseOptions(arguments []string) (cliOptions, error) {
 			workersWasSet = true
 		case "senders":
 			sendersWasSet = true
+		case "cpu-percent":
+			cpuPercentWasSet = true
 		}
 	})
 	if flags.Lookup("url").Value.String() != "" {
@@ -150,6 +154,13 @@ func parseOptions(arguments []string) (cliOptions, error) {
 		parsed := uint32(value)
 		options.overrides.CurlWorkers = &parsed
 	}
+	if cpuPercentWasSet {
+		if *cpuPercentValue == 0 || *cpuPercentValue > 100 {
+			return cliOptions{}, errors.New("Masscan total CPU limit must be between 1 and 100 percent")
+		}
+		value := uint32(*cpuPercentValue)
+		options.overrides.MasscanCPUPercent = &value
+	}
 	return options, nil
 }
 
@@ -165,6 +176,9 @@ func runScan(cfg config.Config, configPath string) error {
 	}
 	if _, err := exec.LookPath("curl"); err != nil {
 		return errors.New("curl is not installed; rerun the cf-san installer")
+	}
+	if _, err := exec.LookPath("cpulimit"); err != nil {
+		return errors.New("cpulimit is not installed; rerun the cf-san installer")
 	}
 	client, err := backend.NewClient(cfg.URL, cfg.Token)
 	if err != nil {
@@ -186,10 +200,12 @@ func runScan(cfg config.Config, configPath string) error {
 	defer manager.RemoveIfCurrent(pid)
 	runner := scanner.Runner{
 		Config: scanner.RunnerConfig{
-			MasscanPath: "masscan",
-			CurlPath:    "curl",
-			Limit:       cfg.Limit,
-			CurlWorkers: cfg.CurlWorkers,
+			MasscanPath:  "masscan",
+			CPULimitPath: "cpulimit",
+			CurlPath:     "curl",
+			Limit:        cfg.Limit,
+			CurlWorkers:  cfg.CurlWorkers,
+			CPUPercent:   cfg.MasscanCPUPercent,
 		},
 		Reporter: client,
 	}

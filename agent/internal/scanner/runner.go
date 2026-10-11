@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,12 +28,17 @@ type Reporter interface {
 type TraceProber func(context.Context, string) (probe.TraceResponse, error)
 
 type RunnerConfig struct {
-	MasscanPath       string
-	CurlPath          string
-	Limit             uint64
-	CurlWorkers       uint32
-	BlockWorkers      uint32
-	HeartbeatInterval time.Duration
+	MasscanPath        string
+	CPULimitPath       string
+	CurlPath           string
+	Limit              uint64
+	CurlWorkers        uint32
+	BlockWorkers       uint32
+	CPUPercent         uint32
+	CPUCount           uint32
+	CPULimitCPUPercent uint64
+	CPULimitForeground bool
+	HeartbeatInterval  time.Duration
 }
 
 // MaxConcurrentBlocks is the default upper bound for concurrent Masscan blocks.
@@ -50,6 +56,9 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 	if config.MasscanPath == "" {
 		config.MasscanPath = "masscan"
 	}
+	if config.CPULimitPath == "" {
+		config.CPULimitPath = "cpulimit"
+	}
 	if config.CurlPath == "" {
 		config.CurlPath = "curl"
 	}
@@ -58,6 +67,16 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 	}
 	if config.CurlWorkers == 0 {
 		config.CurlWorkers = 100
+	}
+	if config.CPUPercent == 0 {
+		config.CPUPercent = 30
+	}
+	if config.CPUCount == 0 {
+		cpus := runtime.NumCPU()
+		if cpus < 1 {
+			cpus = 1
+		}
+		config.CPUCount = uint32(cpus)
 	}
 	if config.BlockWorkers == 0 || config.BlockWorkers > MaxConcurrentBlocks {
 		config.BlockWorkers = MaxConcurrentBlocks
@@ -120,7 +139,16 @@ func (r *Runner) validateRun() (RunnerConfig, error) {
 	if config.CurlWorkers > 4096 {
 		return RunnerConfig{}, errors.New("curl worker count cannot exceed 4096")
 	}
+	if config.CPUPercent > 100 {
+		return RunnerConfig{}, errors.New("Masscan total CPU limit cannot exceed 100 percent")
+	}
+	config.CPULimitForeground = cpulimitSupportsForeground(config.CPULimitPath)
 	return config, nil
+}
+
+func cpulimitSupportsForeground(path string) bool {
+	output, _ := exec.Command(path, "--help").CombinedOutput()
+	return strings.Contains(strings.ToLower(string(output)), "foreground")
 }
 
 func (r *Runner) blockConcurrency(config RunnerConfig) int {
@@ -130,6 +158,10 @@ func (r *Runner) blockConcurrency(config RunnerConfig) int {
 	}
 	if uint64(workers) > config.Limit {
 		workers = uint32(config.Limit)
+	}
+	cpuBudget := uint64(config.CPUPercent) * uint64(config.CPUCount)
+	if uint64(workers) > cpuBudget {
+		workers = uint32(cpuBudget)
 	}
 	if workers == 0 {
 		return 1
@@ -169,6 +201,7 @@ func (r *Runner) runBlockBatch(
 		blockConfig := config
 		blockConfig.Limit = splitLimit(config.Limit, len(blocks), index)
 		blockConfig.CurlWorkers = uint32(splitLimit(uint64(config.CurlWorkers), len(blocks), index))
+		blockConfig.CPULimitCPUPercent = splitLimit(uint64(config.CPUPercent)*uint64(config.CPUCount), len(blocks), index)
 		workers.Add(1)
 		go func(index int, block prefix.Block, blockConfig RunnerConfig) {
 			defer workers.Done()
@@ -220,8 +253,9 @@ func (r *Runner) runBlock(
 		return fmt.Errorf("cannot mark scan block active: %w", err)
 	}
 	r.logf(
-		"ASN %d: scanning block %s (source %s) at %d PPS; block worker %d/%d, aggregate cap %d PPS\n",
+		"ASN %d: scanning block %s (source %s) at %d PPS; block worker %d/%d, aggregate cap %d PPS; Masscan CPU quota %d%% of one CPU (total cap %d%% across %d CPUs)\n",
 		asn, block.BlockCIDR, block.SourcePrefix, config.Limit, workerIndex, workerCount, aggregateLimit,
+		config.CPULimitCPUPercent, config.CPUPercent, config.CPUCount,
 	)
 
 	blockCtx, cancel := context.WithCancel(parent)
@@ -335,21 +369,27 @@ func (r *Runner) runBlockPipeline(
 	scanCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	args := []string{
+	masscanArgs := []string{
 		"-p", "443",
 		"--rate", strconv.FormatUint(config.Limit, 10),
 		"--wait", "1",
 		"--interactive",
 		block.BlockCIDR,
 	}
-	command := newGroupCommand(scanCtx, r.normalizedConfig().MasscanPath, args...)
+	args := make([]string, 0, len(masscanArgs)+5)
+	if config.CPULimitForeground {
+		args = append(args, "-f")
+	}
+	args = append(args, "-l", strconv.FormatUint(config.CPULimitCPUPercent, 10), "--", r.normalizedConfig().MasscanPath)
+	args = append(args, masscanArgs...)
+	command := newGroupCommand(scanCtx, config.CPULimitPath, args...)
 	command.Stderr = os.Stderr
 	output, err := command.StdoutPipe()
 	if err != nil {
 		return errors.New("cannot open Masscan output")
 	}
 	if err := command.Start(); err != nil {
-		return errors.New("cannot start Masscan; verify it is installed and run cf-san with root privileges")
+		return errors.New("cannot start Masscan CPU limiter; verify cpulimit and Masscan are installed and run cf-san with root privileges")
 	}
 
 	targets := make(chan string, int(config.CurlWorkers))

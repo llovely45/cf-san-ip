@@ -1,21 +1,56 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+func TestDefaultsPersistMasscanCPUPercent(t *testing.T) {
+	data, err := json.Marshal(Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"masscanCpuPercent":30`) {
+		t.Fatalf("default config = %s, want 30%% total CPU cap", data)
+	}
+}
+
+func TestLoadMigratesMissingMasscanCPUPercentToThirty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{"url":"https://worker.example","token":"token","asn":64512,"limit":250,"curlWorkers":40,"agentId":"legacy"}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"masscanCpuPercent": 30`) {
+		t.Fatalf("migrated config = %s, want 30%% default CPU cap", data)
+	}
+}
+
 func TestValidateRequiresHTTPSAndPositiveMasscanAndCurlSettings(t *testing.T) {
 	tests := []struct {
 		name string
 		cfg  Config
 	}{
-		{name: "http backend", cfg: Config{URL: "http://worker.example", Token: "token", Limit: 100, CurlWorkers: 20}},
-		{name: "missing token", cfg: Config{URL: "https://worker.example", Limit: 100, CurlWorkers: 20}},
-		{name: "zero rate", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 0, CurlWorkers: 20}},
-		{name: "zero curl workers", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 100, CurlWorkers: 0}},
+		{name: "http backend", cfg: Config{URL: "http://worker.example", Token: "token", Limit: 100, CurlWorkers: 20, MasscanCPUPercent: 30}},
+		{name: "missing token", cfg: Config{URL: "https://worker.example", Limit: 100, CurlWorkers: 20, MasscanCPUPercent: 30}},
+		{name: "zero rate", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 0, CurlWorkers: 20, MasscanCPUPercent: 30}},
+		{name: "zero curl workers", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 100, CurlWorkers: 0, MasscanCPUPercent: 30}},
+		{name: "zero CPU limit", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 100, CurlWorkers: 20, MasscanCPUPercent: 0}},
+		{name: "CPU limit over 100 percent", cfg: Config{URL: "https://worker.example", Token: "token", Limit: 100, CurlWorkers: 20, MasscanCPUPercent: 101}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -28,7 +63,7 @@ func TestValidateRequiresHTTPSAndPositiveMasscanAndCurlSettings(t *testing.T) {
 
 func TestSaveWritesJSONWithMode0600AndLoadRejectsLoosePermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	cfg := Config{URL: "https://worker.example", Token: "sensitive-token", ASN: 64512, Limit: 100, CurlWorkers: 64, AgentID: "agent-test"}
+	cfg := Config{URL: "https://worker.example", Token: "sensitive-token", ASN: 64512, Limit: 100, CurlWorkers: 64, MasscanCPUPercent: 30, AgentID: "agent-test"}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -124,12 +159,12 @@ func TestLoadStillRejectsUnknownConfigFields(t *testing.T) {
 }
 
 func TestOverridesReplaceOnlyExplicitValues(t *testing.T) {
-	base := Config{URL: "https://old.example", Token: "old", ASN: 64512, Limit: 100, CurlWorkers: 25, AgentID: "id"}
+	base := Config{URL: "https://old.example", Token: "old", ASN: 64512, Limit: 100, CurlWorkers: 25, MasscanCPUPercent: 30, AgentID: "id"}
 	asn := uint32(906)
 	limit := uint64(250)
 	workers := uint32(40)
 	got := MergeOverrides(base, Overrides{ASN: &asn, Limit: &limit, CurlWorkers: &workers})
-	want := Config{URL: "https://old.example", Token: "old", ASN: 906, Limit: 250, CurlWorkers: 40, AgentID: "id"}
+	want := Config{URL: "https://old.example", Token: "old", ASN: 906, Limit: 250, CurlWorkers: 40, MasscanCPUPercent: 30, AgentID: "id"}
 	if got != want {
 		t.Fatalf("MergeOverrides() = %#v, want %#v", got, want)
 	}

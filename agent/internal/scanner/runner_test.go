@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +44,22 @@ func makeExecutable(t *testing.T, dir, name, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func makeCPULimitStub(t *testing.T, dir string) string {
+	t.Helper()
+	return makeExecutable(t, dir, "cpulimit", `
+  if [ "$1" = "--help" ]; then
+    echo 'launch target in foreground and wait'
+    exit 0
+  fi
+  if [ "$1" = "-f" ]; then shift; fi
+  [ "$1" = "-l" ] || exit 11
+  shift 2
+  [ "$1" = "--" ] || exit 13
+  shift
+  exec "$@"
+`)
 }
 
 func baseBlock(cidr string) prefix.Block {
@@ -105,7 +124,7 @@ OUTPUT
 	var callsMu sync.Mutex
 	calls := make(map[string]int)
 	runner := Runner{
-		Config:    RunnerConfig{MasscanPath: masscan, Limit: 17, CurlWorkers: 2, BlockWorkers: 1, HeartbeatInterval: time.Hour},
+		Config:    RunnerConfig{MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir), Limit: 17, CurlWorkers: 2, BlockWorkers: 1, HeartbeatInterval: time.Hour},
 		Reporter:  collector,
 		LogOutput: &scanLog,
 		TraceProbe: func(_ context.Context, ip string) (probe.TraceResponse, error) {
@@ -186,7 +205,7 @@ func TestRunScansBlocksInAscendingOrderAndSkipsCompletedBlocks(t *testing.T) {
 	masscan := makeExecutable(t, dir, "masscan", `printf '%s\n' "$*" >> "$MASSCAN_ARGS_FILE"`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 10, BlockWorkers: 1, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir), Limit: 100, CurlWorkers: 10, BlockWorkers: 1, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			t.Fatal("no open targets expected")
@@ -253,7 +272,7 @@ func TestRunScansFourBlocksConcurrentlyAndSharesConfiguredLimits(t *testing.T) {
 	var active, maxActive atomic.Int32
 	var validations atomic.Int32
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 8, BlockWorkers: 4, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir), Limit: 100, CurlWorkers: 8, BlockWorkers: 4, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			n := active.Add(1)
@@ -312,13 +331,119 @@ func TestRunScansFourBlocksConcurrentlyAndSharesConfiguredLimits(t *testing.T) {
 	}
 }
 
+func TestRunSharesThirtyPercentTotalCPUBudgetAcrossMasscanBlocks(t *testing.T) {
+	dir := t.TempDir()
+	cpuArgsFile := filepath.Join(dir, "cpulimit.args")
+	t.Setenv("CPULIMIT_ARGS_FILE", cpuArgsFile)
+	currentPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+currentPath)
+	makeExecutable(t, dir, "cpulimit", `
+  if [ "$1" = "--help" ]; then
+    echo 'launch target in foreground and wait'
+    exit 0
+  fi
+  if [ "$1" = "-f" ]; then foreground=1; shift; else foreground=0; fi
+  [ "$1" = "-l" ] || exit 11
+  printf '%s %s\n' "$foreground" "$2" >> "$CPULIMIT_ARGS_FILE"
+  shift 2
+  [ "$1" = "--" ] || exit 13
+  shift
+  exec "$@"
+`)
+	masscan := makeExecutable(t, dir, "masscan", `printf '# no open ports\n'`)
+	runner := Runner{
+		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 8, BlockWorkers: 4, HeartbeatInterval: time.Hour},
+		Reporter: &reportCollector{},
+	}
+	blocks := []prefix.Block{
+		{ASN: 64512, SourcePrefix: "8.8.0.0/24", BlockCIDR: "8.8.0.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.1.0/24", BlockCIDR: "8.8.1.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.2.0/24", BlockCIDR: "8.8.2.0/24", Status: "active"},
+		{ASN: 64512, SourcePrefix: "8.8.3.0/24", BlockCIDR: "8.8.3.0/24", Status: "active"},
+	}
+	if err := runner.Run(context.Background(), 64512, blocks); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(cpuArgsFile)
+	if err != nil {
+		t.Fatalf("Masscan was not launched through the CPU limiter: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("CPU limiter invocations = %d, want 4: %q", len(lines), lines)
+	}
+	var total int
+	quotas := make([]int, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "1" {
+			t.Fatalf("cpulimit did not use foreground mode: %q", line)
+		}
+		quota, err := strconv.Atoi(fields[1])
+		if err != nil {
+			t.Fatalf("invalid per-process CPU quota %q: %v", fields[1], err)
+		}
+		quotas = append(quotas, quota)
+		total += quota
+	}
+	if total != runtime.NumCPU()*30 {
+		t.Fatalf("sum of per-block cpulimit quotas = %d, want 30%% of %d logical CPUs (%d)", total, runtime.NumCPU(), runtime.NumCPU()*30)
+	}
+	sort.Ints(quotas)
+	if quotas[3]-quotas[0] > 1 {
+		t.Fatalf("per-block CPU quotas are not evenly distributed: %v", quotas)
+	}
+}
+
+func TestRunUsesAlpineCPULimitCommandModeWithoutDebianForegroundFlag(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "cpulimit.args")
+	t.Setenv("CPULIMIT_ARGS_FILE", argsFile)
+	cpulimit := makeExecutable(t, dir, "cpulimit", `
+  if [ "$1" = "--help" ]; then
+    echo 'Usage: cpulimit [OPTIONS...] TARGET'
+    exit 0
+  fi
+  printf '%s\n' "$*" > "$CPULIMIT_ARGS_FILE"
+  [ "$1" = "-l" ] || exit 11
+  shift 2
+  [ "$1" = "--" ] || exit 12
+  shift
+  exec "$@"
+`)
+	masscan := makeExecutable(t, dir, "masscan", `printf '# no open ports\n'`)
+	runner := Runner{
+		Config:   RunnerConfig{MasscanPath: masscan, CPULimitPath: cpulimit, Limit: 10, CurlWorkers: 2, BlockWorkers: 1},
+		Reporter: &reportCollector{},
+	}
+	if err := runner.Run(context.Background(), 64512, []prefix.Block{baseBlock("8.8.8.0/24")}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Fields(string(data))
+	if len(args) < 5 || args[0] != "-l" {
+		t.Fatalf("Alpine cpulimit args = %q, want -l quota -- masscan ...", data)
+	}
+	for _, arg := range args {
+		if arg == "-f" || arg == "-i" {
+			t.Fatalf("Alpine cpulimit args include unsupported flag %q: %q", arg, data)
+		}
+	}
+	if args[2] != "--" || args[3] != masscan {
+		t.Fatalf("Alpine cpulimit target args = %q, want -- %s ...", data, masscan)
+	}
+}
+
 func TestHeartbeatReportsLatestOpenPortDuringLongMasscanRun(t *testing.T) {
 	dir := t.TempDir()
 	started := filepath.Join(dir, "started")
 	masscan := makeExecutable(t, dir, "masscan", `printf 'Discovered open port 443/tcp on 8.8.8.10\n'; touch "$STARTED_FILE"; sleep 0.18`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 2, HeartbeatInterval: 20 * time.Millisecond},
+		Config:   RunnerConfig{MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir), Limit: 100, CurlWorkers: 2, HeartbeatInterval: 20 * time.Millisecond},
 		Reporter: collector,
 		TraceProbe: func(context.Context, string) (probe.TraceResponse, error) {
 			return probe.TraceResponse{}, fmt.Errorf("curl failed")
@@ -349,7 +474,7 @@ func TestCancellationLeavesActiveMasscanBlockIncomplete(t *testing.T) {
 	masscan := makeExecutable(t, dir, "masscan", `touch "$STARTED_FILE"; sleep 30`)
 	collector := &reportCollector{}
 	runner := Runner{
-		Config:   RunnerConfig{MasscanPath: masscan, Limit: 100, CurlWorkers: 2, HeartbeatInterval: time.Hour},
+		Config:   RunnerConfig{MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir), Limit: 100, CurlWorkers: 2, HeartbeatInterval: time.Hour},
 		Reporter: collector,
 	}
 	t.Setenv("STARTED_FILE", started)

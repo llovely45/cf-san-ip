@@ -82,17 +82,41 @@ install_masscan() {
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
       apt-get update
       PCAP_PACKAGE=$(debian_pcap_package)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y masscan "$PCAP_PACKAGE"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y masscan cpulimit "$PCAP_PACKAGE"
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-      apk add --no-cache masscan
+      apk add --no-cache masscan cpulimit
       ;;
     *)
       fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
       ;;
   esac
   command -v masscan >/dev/null 2>&1 || fail 'Masscan installation failed; install the masscan package and retry'
+}
+
+ensure_cpulimit() {
+  if command -v cpulimit >/dev/null 2>&1; then
+    return 0
+  fi
+  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}" in
+    debian)
+      command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y cpulimit
+      ;;
+    alpine)
+      command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
+      apk add --no-cache cpulimit
+      ;;
+    *)
+      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      ;;
+  esac
+  command -v cpulimit >/dev/null 2>&1 || fail 'cpulimit installation failed'
 }
 
 if [ "$UPDATE_ONLY" -eq 0 ]; then
@@ -105,11 +129,11 @@ if [ "$UPDATE_ONLY" -eq 0 ]; then
       apt-get update
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
       PCAP_PACKAGE=$(debian_pcap_package)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip masscan "$PCAP_PACKAGE"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip masscan cpulimit "$PCAP_PACKAGE"
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-      apk add --no-cache ca-certificates curl coreutils tar gzip masscan
+      apk add --no-cache ca-certificates curl coreutils tar gzip masscan cpulimit
       ;;
     *)
       fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
@@ -135,6 +159,7 @@ else
   fi
 fi
 
+ensure_cpulimit
 command -v masscan >/dev/null 2>&1 || fail 'Masscan is not installed; install the masscan package and retry'
 command -v curl >/dev/null 2>&1 || fail 'curl is not installed; install curl and retry'
 

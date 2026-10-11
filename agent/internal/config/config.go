@@ -15,32 +15,38 @@ import (
 )
 
 type Config struct {
-	URL         string `json:"url"`
-	Token       string `json:"token"`
-	ASN         uint32 `json:"asn"`
-	Limit       uint64 `json:"limit"`
-	CurlWorkers uint32 `json:"curlWorkers"`
-	AgentID     string `json:"agentId"`
+	URL               string `json:"url"`
+	Token             string `json:"token"`
+	ASN               uint32 `json:"asn"`
+	Limit             uint64 `json:"limit"`
+	CurlWorkers       uint32 `json:"curlWorkers"`
+	MasscanCPUPercent uint32 `json:"masscanCpuPercent"`
+	AgentID           string `json:"agentId"`
 }
 
-const maxCurlWorkers = 4096
+const (
+	maxCurlWorkers           = 4096
+	DefaultMasscanCPUPercent = 30
+)
 
 type Overrides struct {
-	URL         *string
-	Token       *string
-	ASN         *uint32
-	Limit       *uint64
-	CurlWorkers *uint32
+	URL               *string
+	Token             *string
+	ASN               *uint32
+	Limit             *uint64
+	CurlWorkers       *uint32
+	MasscanCPUPercent *uint32
 }
 
 type configJSON struct {
-	URL         string  `json:"url"`
-	Token       string  `json:"token"`
-	ASN         uint32  `json:"asn"`
-	Limit       uint64  `json:"limit"`
-	CurlWorkers uint32  `json:"curlWorkers"`
-	Senders     *uint32 `json:"senders"`
-	AgentID     string  `json:"agentId"`
+	URL               string  `json:"url"`
+	Token             string  `json:"token"`
+	ASN               uint32  `json:"asn"`
+	Limit             uint64  `json:"limit"`
+	CurlWorkers       uint32  `json:"curlWorkers"`
+	MasscanCPUPercent uint32  `json:"masscanCpuPercent"`
+	Senders           *uint32 `json:"senders"`
+	AgentID           string  `json:"agentId"`
 }
 
 // UnmarshalJSON migrates the pre-Masscan senders setting to CurlWorkers while
@@ -65,19 +71,24 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 			workers = maxCurlWorkers
 		}
 	}
+	cpuPercent := value.MasscanCPUPercent
+	if cpuPercent == 0 {
+		cpuPercent = DefaultMasscanCPUPercent
+	}
 	*cfg = Config{
-		URL:         value.URL,
-		Token:       value.Token,
-		ASN:         value.ASN,
-		Limit:       value.Limit,
-		CurlWorkers: workers,
-		AgentID:     value.AgentID,
+		URL:               value.URL,
+		Token:             value.Token,
+		ASN:               value.ASN,
+		Limit:             value.Limit,
+		CurlWorkers:       workers,
+		MasscanCPUPercent: cpuPercent,
+		AgentID:           value.AgentID,
 	}
 	return nil
 }
 
 func Defaults() Config {
-	return Config{Limit: 100, CurlWorkers: 100, AgentID: newAgentID()}
+	return Config{Limit: 100, CurlWorkers: 100, MasscanCPUPercent: DefaultMasscanCPUPercent, AgentID: newAgentID()}
 }
 
 func ValidateBackendURL(value string) error {
@@ -103,6 +114,9 @@ func Validate(cfg Config) error {
 	}
 	if cfg.CurlWorkers > maxCurlWorkers {
 		return errors.New("curl worker count cannot exceed 4096")
+	}
+	if cfg.MasscanCPUPercent == 0 || cfg.MasscanCPUPercent > 100 {
+		return errors.New("Masscan total CPU limit must be between 1 and 100 percent")
 	}
 	return nil
 }
@@ -136,11 +150,17 @@ func MergeOverrides(base Config, overrides Overrides) Config {
 	if overrides.CurlWorkers != nil {
 		base.CurlWorkers = *overrides.CurlWorkers
 	}
+	if overrides.MasscanCPUPercent != nil {
+		base.MasscanCPUPercent = *overrides.MasscanCPUPercent
+	}
 	if base.Limit == 0 {
 		base.Limit = 100
 	}
 	if base.CurlWorkers == 0 {
 		base.CurlWorkers = 100
+	}
+	if base.MasscanCPUPercent == 0 {
+		base.MasscanCPUPercent = DefaultMasscanCPUPercent
 	}
 	if base.AgentID == "" {
 		base.AgentID = newAgentID()
@@ -187,6 +207,9 @@ func configHasNoTrailingValue(decoder *json.Decoder) error {
 }
 
 func Save(path string, cfg Config) error {
+	if cfg.MasscanCPUPercent == 0 {
+		cfg.MasscanCPUPercent = DefaultMasscanCPUPercent
+	}
 	if err := Validate(cfg); err != nil {
 		return fmt.Errorf("cannot save agent config: %w", err)
 	}
