@@ -30,7 +30,46 @@ type Report struct {
 	BlockCIDR    string     `json:"blockCidr"`
 	Status       string     `json:"status"`
 	LatestIP     string     `json:"latestIp,omitempty"`
+	AgentID      string     `json:"agentId,omitempty"`
+	LeaseID      string     `json:"leaseId,omitempty"`
 	Candidate    *Candidate `json:"candidate,omitempty"`
+}
+
+type leaseRequest struct {
+	ASN          uint32 `json:"asn"`
+	SourcePrefix string `json:"sourcePrefix"`
+	BlockCIDR    string `json:"blockCidr"`
+	AgentID      string `json:"agentId"`
+	LeaseID      string `json:"leaseId,omitempty"`
+}
+
+type claimCandidate struct {
+	SourcePrefix string `json:"sourcePrefix"`
+	BlockCIDR    string `json:"blockCidr"`
+}
+
+type claimNextRequest struct {
+	ASN       uint32           `json:"asn"`
+	AgentID   string           `json:"agentId"`
+	MaxBlocks uint32           `json:"maxBlocks"`
+	Blocks    []claimCandidate `json:"blocks"`
+}
+
+type BlockClaim struct {
+	Block prefix.Block
+	State string
+}
+
+type claimOutcome struct {
+	SourcePrefix string `json:"sourcePrefix"`
+	BlockCIDR    string `json:"blockCidr"`
+	State        string `json:"state"`
+	LeaseID      string `json:"leaseId,omitempty"`
+}
+
+type leaseResponse struct {
+	Results  []claimOutcome `json:"results"`
+	Examined int            `json:"examined"`
 }
 
 type planResponse struct {
@@ -44,14 +83,23 @@ type planResponse struct {
 type Client struct {
 	baseURL    string
 	token      string
+	agentID    string
 	httpClient *http.Client
 }
 
-func NewClient(baseURL, token string) (*Client, error) {
-	return newClient(baseURL, token, &http.Client{Timeout: 15 * time.Second})
+func NewClient(baseURL, token string, agentIDs ...string) (*Client, error) {
+	agentID := ""
+	if len(agentIDs) > 0 {
+		agentID = agentIDs[0]
+	}
+	return newClientWithAgentID(baseURL, token, agentID, &http.Client{Timeout: 15 * time.Second})
 }
 
 func newClient(baseURL, token string, httpClient *http.Client) (*Client, error) {
+	return newClientWithAgentID(baseURL, token, "", httpClient)
+}
+
+func newClientWithAgentID(baseURL, token, agentID string, httpClient *http.Client) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("backend URL must be HTTPS without credentials, query, or fragment")
@@ -72,7 +120,7 @@ func newClient(baseURL, token string, httpClient *http.Client) (*Client, error) 
 		return http.ErrUseLastResponse
 	}
 	base := strings.TrimRight(parsed.String(), "/")
-	return &Client{baseURL: base, token: token, httpClient: httpClient}, nil
+	return &Client{baseURL: base, token: token, agentID: strings.TrimSpace(agentID), httpClient: httpClient}, nil
 }
 
 func (c *Client) Plan(ctx context.Context, asn uint32) (*prefix.Plan, error) {
@@ -111,11 +159,93 @@ func (c *Client) Plan(ctx context.Context, asn uint32) (*prefix.Plan, error) {
 }
 
 func (c *Client) Report(ctx context.Context, report Report) error {
+	if report.AgentID == "" {
+		report.AgentID = c.agentID
+	}
 	body, err := json.Marshal(report)
 	if err != nil {
 		return errors.New("cannot encode scan report")
 	}
 	_, err = c.request(ctx, http.MethodPost, c.baseURL+"/api/agent/v1/report", body)
+	return err
+}
+
+func (c *Client) ClaimBlocks(
+	ctx context.Context,
+	asn uint32,
+	candidates []prefix.Block,
+	maxBlocks uint32,
+) ([]BlockClaim, int, error) {
+	if c.agentID == "" {
+		return nil, 0, errors.New("agent ID is required to claim scan blocks")
+	}
+	if asn == 0 || len(candidates) == 0 || len(candidates) > 64 || maxBlocks == 0 || maxBlocks > 4 {
+		return nil, 0, errors.New("scan block claim must contain 1-64 candidates and request 1-4 leases")
+	}
+	claimCandidates := make([]claimCandidate, len(candidates))
+	for index, candidate := range candidates {
+		if candidate.ASN != 0 && candidate.ASN != asn {
+			return nil, 0, errors.New("scan block candidate belongs to a different ASN")
+		}
+		claimCandidates[index] = claimCandidate{SourcePrefix: candidate.SourcePrefix, BlockCIDR: candidate.BlockCIDR}
+	}
+	body, err := json.Marshal(claimNextRequest{
+		ASN: asn, AgentID: c.agentID, MaxBlocks: maxBlocks, Blocks: claimCandidates,
+	})
+	if err != nil {
+		return nil, 0, errors.New("cannot encode scan block claim")
+	}
+	response, err := c.request(ctx, http.MethodPost, c.baseURL+"/api/agent/v1/claim", body)
+	if err != nil {
+		return nil, 0, err
+	}
+	var result leaseResponse
+	if err := json.Unmarshal(response, &result); err != nil {
+		return nil, 0, errors.New("backend returned an invalid scan block claim")
+	}
+	if result.Examined != len(result.Results) || result.Examined > len(candidates) || result.Examined < 0 {
+		return nil, 0, errors.New("backend returned an inconsistent scan block claim")
+	}
+	claimedCount := uint32(0)
+	claims := make([]BlockClaim, len(result.Results))
+	for index, outcome := range result.Results {
+		candidate := candidates[index]
+		if outcome.SourcePrefix != candidate.SourcePrefix || outcome.BlockCIDR != candidate.BlockCIDR {
+			return nil, 0, errors.New("backend returned scan block results out of order")
+		}
+		if outcome.State != "claimed" && outcome.State != "leased" && outcome.State != "completed" {
+			return nil, 0, errors.New("backend returned an invalid scan block state")
+		}
+		block := prefix.Block{
+			ASN: asn, SourcePrefix: outcome.SourcePrefix, BlockCIDR: outcome.BlockCIDR,
+			Status: "active", LeaseID: outcome.LeaseID,
+		}
+		if outcome.State == "claimed" {
+			if strings.TrimSpace(outcome.LeaseID) == "" {
+				return nil, 0, errors.New("backend claimed a scan block without a lease ID")
+			}
+			claimedCount++
+		}
+		claims[index] = BlockClaim{Block: block, State: outcome.State}
+	}
+	if claimedCount > maxBlocks {
+		return nil, 0, errors.New("backend claimed more blocks than requested")
+	}
+	return claims, result.Examined, nil
+}
+
+func (c *Client) ReleaseBlock(ctx context.Context, block prefix.Block, leaseID string) error {
+	if c.agentID == "" || strings.TrimSpace(leaseID) == "" {
+		return errors.New("agent ID and lease ID are required to release a scan block")
+	}
+	body, err := json.Marshal(leaseRequest{
+		ASN: block.ASN, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR,
+		AgentID: c.agentID, LeaseID: leaseID,
+	})
+	if err != nil {
+		return errors.New("cannot encode scan block release")
+	}
+	_, err = c.request(ctx, http.MethodPost, c.baseURL+"/api/agent/v1/release", body)
 	return err
 }
 

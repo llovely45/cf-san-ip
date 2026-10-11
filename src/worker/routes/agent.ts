@@ -5,11 +5,19 @@ import { validateIpInput } from "../../shared/ip";
 import type { Env } from "../env";
 import { apiTokenMiddleware, createApiTokenMiddleware } from "../middleware/api-token";
 import type { ScanBlockStatus } from "../repositories/scan-blocks";
-import { D1ScanCheckpointRepository, type ScanProgress } from "../repositories/scan-checkpoints";
+import {
+  D1ScanCheckpointRepository,
+  SCAN_BLOCK_LEASE_TIMEOUT_SECONDS,
+  type ScanBlockLease,
+  type ScanProgress,
+} from "../repositories/scan-checkpoints";
 import { fetchOriginatingIPv4Prefixes } from "../services/ripe-prefixes";
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const MAX_AGENT_BLOCK_LEASES = 4;
+const MAX_CLAIM_CANDIDATES = 64;
 
 function parseAsn(value: string | null): number | null {
   if (value === null || !/^\d+$/u.test(value)) {
@@ -21,6 +29,34 @@ function parseAsn(value: string | null): number | null {
 
 function parseStatus(value: unknown): ScanBlockStatus | null {
   return value === "active" || value === "completed" ? value : null;
+}
+
+function parseAgentId(value: unknown): string | null {
+  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : null;
+}
+
+function parseLeaseId(value: unknown): string | null {
+  return typeof value === "string" && value.length >= 16 && value.length <= 128 ? value : null;
+}
+
+function parseLeaseInput(input: Record<string, unknown>): Omit<ScanBlockLease, "leaseId"> | null {
+  if (
+    typeof input.asn !== "number" || !Number.isSafeInteger(input.asn) || input.asn <= 0 ||
+    typeof input.sourcePrefix !== "string" || typeof input.blockCidr !== "string" ||
+    !isIPv4ScanBlock(input.sourcePrefix, input.blockCidr)
+  ) {
+    return null;
+  }
+  const agentId = parseAgentId(input.agentId);
+  if (agentId === null) {
+    return null;
+  }
+  return {
+    asn: input.asn,
+    sourcePrefix: input.sourcePrefix,
+    blockCidr: input.blockCidr,
+    agentId,
+  };
 }
 
 export function createAgentRoutes(
@@ -67,6 +103,103 @@ export function createAgentRoutes(
     return context.json({ asn, prefixes, checkpoints, blockCheckpoints });
   });
 
+  routes.post("/claim", async (context) => {
+    let input: unknown;
+    try {
+      input = await context.req.json();
+    } catch {
+      return context.json({ error: "invalid_json" }, 400);
+    }
+    if (!isObject(input)) {
+      return context.json({ error: "invalid_lease_request" }, 400);
+    }
+    const asn = input.asn;
+    const agentId = parseAgentId(input.agentId);
+    const maxBlocks = input.maxBlocks;
+    const candidates = input.blocks;
+    if (
+      typeof asn !== "number" || !Number.isSafeInteger(asn) || asn <= 0 ||
+      agentId === null ||
+      typeof maxBlocks !== "number" || !Number.isSafeInteger(maxBlocks) ||
+      maxBlocks < 1 || maxBlocks > MAX_AGENT_BLOCK_LEASES ||
+      !Array.isArray(candidates) || candidates.length < 1 || candidates.length > MAX_CLAIM_CANDIDATES
+    ) {
+      return context.json({ error: "invalid_lease_request" }, 400);
+    }
+
+    const repository = new D1ScanCheckpointRepository(resolveDb(context));
+    const currentPrefixes = await repository.getCurrentPlan(asn);
+    if (currentPrefixes === null) {
+      return context.json({ error: "scan_plan_not_initialized" }, 409);
+    }
+    const currentPrefixSet = new Set(currentPrefixes);
+    const seen = new Set<string>();
+    const parsedCandidates: Array<{ sourcePrefix: string; blockCidr: string }> = [];
+    for (const candidate of candidates) {
+      if (
+        !isObject(candidate) ||
+        typeof candidate.sourcePrefix !== "string" ||
+        typeof candidate.blockCidr !== "string" ||
+        !isIPv4ScanBlock(candidate.sourcePrefix, candidate.blockCidr) ||
+        !currentPrefixSet.has(candidate.sourcePrefix)
+      ) {
+        return context.json({ error: "invalid_lease_candidate" }, 400);
+      }
+      const key = `${candidate.sourcePrefix}\n${candidate.blockCidr}`;
+      if (seen.has(key)) {
+        return context.json({ error: "duplicate_lease_candidate" }, 400);
+      }
+      seen.add(key);
+      parsedCandidates.push({ sourcePrefix: candidate.sourcePrefix, blockCidr: candidate.blockCidr });
+    }
+
+    const results: Array<{
+      asn: number;
+      sourcePrefix: string;
+      blockCidr: string;
+      state: "claimed" | "leased" | "completed";
+      leaseId?: string;
+    }> = [];
+    let claimedCount = 0;
+    for (const candidate of parsedCandidates) {
+      const base = { asn, ...candidate };
+      const lease: ScanBlockLease = { ...base, agentId, leaseId: crypto.randomUUID() };
+      if (await repository.claimBlock(lease)) {
+        results.push({ ...base, state: "claimed", leaseId: lease.leaseId });
+        claimedCount++;
+      } else {
+        const completed = await repository.isBlockCompleted(asn, candidate.sourcePrefix, candidate.blockCidr);
+        results.push({ ...base, state: completed ? "completed" : "leased" });
+      }
+      if (claimedCount >= maxBlocks) {
+        break;
+      }
+    }
+    return context.json({ results, examined: results.length, leaseTimeoutSeconds: SCAN_BLOCK_LEASE_TIMEOUT_SECONDS });
+  });
+
+  routes.post("/release", async (context) => {
+    let input: unknown;
+    try {
+      input = await context.req.json();
+    } catch {
+      return context.json({ error: "invalid_json" }, 400);
+    }
+    if (!isObject(input)) {
+      return context.json({ error: "invalid_lease_request" }, 400);
+    }
+    const leaseBase = parseLeaseInput(input);
+    const leaseId = parseLeaseId(input.leaseId);
+    if (leaseBase === null || leaseId === null) {
+      return context.json({ error: "invalid_lease_request" }, 400);
+    }
+    const released = await new D1ScanCheckpointRepository(resolveDb(context)).releaseBlock({
+      ...leaseBase,
+      leaseId,
+    });
+    return context.json({ ok: true, released });
+  });
+
   routes.post("/report", async (context) => {
     let input: unknown;
     try {
@@ -82,6 +215,8 @@ export function createAgentRoutes(
     const sourcePrefix = input.sourcePrefix;
     const blockCidr = input.blockCidr;
     const status = parseStatus(input.status);
+    const agentId = parseAgentId(input.agentId);
+    const leaseId = parseLeaseId(input.leaseId);
     if (
       typeof asn !== "number" ||
       !Number.isSafeInteger(asn) ||
@@ -92,6 +227,9 @@ export function createAgentRoutes(
       !isIPv4ScanBlock(sourcePrefix, blockCidr)
     ) {
       return context.json({ error: "invalid_report" }, 400);
+    }
+    if (agentId === null || leaseId === null) {
+      return context.json({ error: "lease_required" }, 409);
     }
 
     let latestIp: string | null = null;
@@ -116,10 +254,14 @@ export function createAgentRoutes(
       blockCidr,
       status,
       latestIp,
+      agentId,
+      leaseId,
     };
 
     if (input.candidate === undefined) {
-      await repository.updateProgress(progress);
+      if (!(await repository.updateProgress(progress))) {
+        return context.json({ error: "lease_lost" }, 409);
+      }
       return context.json({ ok: true });
     }
 
@@ -142,7 +284,9 @@ export function createAgentRoutes(
       return context.json({ error: "invalid_candidate" }, 400);
     }
 
-    await repository.upsertCandidateAndProgress(progress, candidate.value);
+    if (!(await repository.upsertCandidateAndProgress(progress, candidate.value))) {
+      return context.json({ error: "lease_lost" }, 409);
+    }
     return context.json({ ok: true });
   });
 

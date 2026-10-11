@@ -180,7 +180,7 @@ func runScan(cfg config.Config, configPath string) error {
 	if _, err := exec.LookPath("cpulimit"); err != nil {
 		return errors.New("cpulimit is not installed; rerun the cf-san installer")
 	}
-	client, err := backend.NewClient(cfg.URL, cfg.Token)
+	client, err := backend.NewClient(cfg.URL, cfg.Token, cfg.AgentID)
 	if err != nil {
 		return err
 	}

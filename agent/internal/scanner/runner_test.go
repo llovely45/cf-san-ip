@@ -24,6 +24,75 @@ type reportCollector struct {
 	reports []backend.Report
 }
 
+type sharedTestLeases struct {
+	mu        sync.Mutex
+	owners    map[string]string
+	claimed   map[string]string
+	completed map[string]bool
+	reports   []backend.Report
+	releases  int
+}
+
+type testLeaseAgent struct {
+	id     string
+	shared *sharedTestLeases
+}
+
+func (a *testLeaseAgent) ClaimBlocks(_ context.Context, asn uint32, candidates []prefix.Block, limit uint32) ([]backend.BlockClaim, int, error) {
+	a.shared.mu.Lock()
+	defer a.shared.mu.Unlock()
+	if a.shared.owners == nil {
+		a.shared.owners = make(map[string]string)
+		a.shared.claimed = make(map[string]string)
+		a.shared.completed = make(map[string]bool)
+	}
+	var results []backend.BlockClaim
+	claimedCount := uint32(0)
+	for _, candidate := range candidates {
+		block := candidate
+		block.ASN = asn
+		if a.shared.completed[block.BlockCIDR] {
+			results = append(results, backend.BlockClaim{Block: block, State: "completed"})
+			continue
+		}
+		if _, exists := a.shared.owners[block.BlockCIDR]; exists {
+			results = append(results, backend.BlockClaim{Block: block, State: "leased"})
+			continue
+		}
+		leaseID := a.id + ":" + block.BlockCIDR
+		block.LeaseID = leaseID
+		a.shared.owners[block.BlockCIDR] = leaseID
+		a.shared.claimed[block.BlockCIDR] = a.id
+		results = append(results, backend.BlockClaim{Block: block, State: "claimed"})
+		claimedCount++
+		if claimedCount >= limit {
+			break
+		}
+	}
+	return results, len(results), nil
+}
+
+func (a *testLeaseAgent) ReleaseBlock(_ context.Context, block prefix.Block, leaseID string) error {
+	a.shared.mu.Lock()
+	defer a.shared.mu.Unlock()
+	if a.shared.owners[block.BlockCIDR] == leaseID {
+		delete(a.shared.owners, block.BlockCIDR)
+		a.shared.releases++
+	}
+	return nil
+}
+
+func (a *testLeaseAgent) Report(_ context.Context, report backend.Report) error {
+	a.shared.mu.Lock()
+	defer a.shared.mu.Unlock()
+	a.shared.reports = append(a.shared.reports, report)
+	if report.Status == "completed" && a.shared.owners[report.BlockCIDR] == report.LeaseID {
+		delete(a.shared.owners, report.BlockCIDR)
+		a.shared.completed[report.BlockCIDR] = true
+	}
+	return nil
+}
+
 func (c *reportCollector) Report(_ context.Context, report backend.Report) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -392,6 +461,118 @@ func TestRunSharesThirtyPercentTotalCPUBudgetAcrossMasscanBlocks(t *testing.T) {
 	sort.Ints(quotas)
 	if quotas[3]-quotas[0] > 1 {
 		t.Fatalf("per-block CPU quotas are not evenly distributed: %v", quotas)
+	}
+}
+
+func TestRunPlanClaimsDifferentBlocksAcrossAgents(t *testing.T) {
+	dir := t.TempDir()
+	masscan := makeExecutable(t, dir, "masscan", `
+	last=""
+	for argument do last="$argument"; done
+	case "$last" in
+	  8.8.*.0/24) sleep 0.04 ;;
+	  *) exit 8 ;;
+	esac
+`)
+	prefixes := make([]string, 8)
+	for index := range prefixes {
+		prefixes[index] = fmt.Sprintf("8.8.%d.0/24", index)
+	}
+	plan, err := prefix.NewPlan(64512, prefixes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := &sharedTestLeases{}
+	makeRunner := func(agentID string) Runner {
+		return Runner{
+			Config: RunnerConfig{
+				MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir),
+				Limit: 400, CurlWorkers: 16, BlockWorkers: 4, HeartbeatInterval: time.Hour, LeasePollInterval: 5 * time.Millisecond,
+			},
+			Reporter: &testLeaseAgent{id: agentID, shared: shared},
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, agentID := range []string{"agent-a", "agent-b"} {
+		runner := makeRunner(agentID)
+		go func() {
+			<-start
+			results <- runner.RunPlan(context.Background(), plan)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	shared.mu.Lock()
+	defer shared.mu.Unlock()
+	if len(shared.claimed) != len(prefixes) {
+		t.Fatalf("claimed blocks = %d, want %d; owners=%#v", len(shared.claimed), len(prefixes), shared.claimed)
+	}
+	activeReports := make(map[string]int)
+	for _, report := range shared.reports {
+		if report.Status == "active" {
+			activeReports[report.BlockCIDR]++
+		}
+	}
+	for _, cidr := range prefixes {
+		blockCIDR := cidr
+		if activeReports[blockCIDR] != 1 {
+			t.Errorf("block %s active reports = %d, want exactly one leased owner", blockCIDR, activeReports[blockCIDR])
+		}
+	}
+}
+
+func TestPauseReleasesClaimedBlockImmediately(t *testing.T) {
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	masscan := makeExecutable(t, dir, "masscan", `touch "$STARTED_FILE"; sleep 30`)
+	block := baseBlock("8.8.8.0/24")
+	plan, err := prefix.NewPlan(64512, []string{block.BlockCIDR}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := &sharedTestLeases{}
+	runner := Runner{
+		Config: RunnerConfig{
+			MasscanPath: masscan, CPULimitPath: makeCPULimitStub(t, dir),
+			Limit: 100, CurlWorkers: 2, BlockWorkers: 1,
+			HeartbeatInterval: time.Hour, LeasePollInterval: time.Millisecond,
+		},
+		Reporter: &testLeaseAgent{id: "agent-a", shared: shared},
+	}
+	t.Setenv("STARTED_FILE", started)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- runner.RunPlan(ctx, plan) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("Masscan fake did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-result; err == nil {
+		t.Fatal("RunPlan() error = nil after pause")
+	}
+	shared.mu.Lock()
+	defer shared.mu.Unlock()
+	if shared.releases != 1 {
+		t.Fatalf("released leases = %d, want 1", shared.releases)
+	}
+	if _, stillOwned := shared.owners[block.BlockCIDR]; stillOwned {
+		t.Fatalf("paused agent still owns block %s", block.BlockCIDR)
 	}
 }
 

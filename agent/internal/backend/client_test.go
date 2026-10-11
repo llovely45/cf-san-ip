@@ -228,19 +228,97 @@ func TestReportSendsCandidateJSONToAuthenticatedEndpoint(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
-	client, err := newClient(server.URL, "token", server.Client())
+	client, err := newClientWithAgentID(server.URL, "token", "machine-a", server.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
 	candidate := &Candidate{IP: "8.8.8.8", Port: 443, ASN: 64512, Region: "US"}
 	err = client.Report(context.Background(), Report{
 		ASN: 64512, SourcePrefix: "8.8.8.0/24", BlockCIDR: "8.8.8.0/24", Status: "active", Candidate: candidate,
+		LeaseID: "lease-token-1234567890",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if received.Candidate == nil || received.Candidate.IP != candidate.IP || received.Status != "active" {
 		t.Fatalf("received report = %#v", received)
+	}
+	if received.AgentID != "machine-a" || received.LeaseID != "lease-token-1234567890" {
+		t.Fatalf("received lease identity = %q/%q", received.AgentID, received.LeaseID)
+	}
+}
+
+func TestClaimCandidateBatchAndReleaseUseAgentIdentityAndBearerAuth(t *testing.T) {
+	var requests []struct {
+		Path          string           `json:"-"`
+		Authorization string           `json:"-"`
+		AgentID       string           `json:"agentId"`
+		LeaseID       string           `json:"leaseId"`
+		ASN           uint32           `json:"asn"`
+		SourcePrefix  string           `json:"sourcePrefix"`
+		BlockCIDR     string           `json:"blockCidr"`
+		MaxBlocks     uint32           `json:"maxBlocks"`
+		Blocks        []claimCandidate `json:"blocks"`
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			AgentID      string           `json:"agentId"`
+			LeaseID      string           `json:"leaseId"`
+			ASN          uint32           `json:"asn"`
+			SourcePrefix string           `json:"sourcePrefix"`
+			BlockCIDR    string           `json:"blockCidr"`
+			MaxBlocks    uint32           `json:"maxBlocks"`
+			Blocks       []claimCandidate `json:"blocks"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		requests = append(requests, struct {
+			Path          string           `json:"-"`
+			Authorization string           `json:"-"`
+			AgentID       string           `json:"agentId"`
+			LeaseID       string           `json:"leaseId"`
+			ASN           uint32           `json:"asn"`
+			SourcePrefix  string           `json:"sourcePrefix"`
+			BlockCIDR     string           `json:"blockCidr"`
+			MaxBlocks     uint32           `json:"maxBlocks"`
+			Blocks        []claimCandidate `json:"blocks"`
+		}{r.URL.Path, r.Header.Get("Authorization"), body.AgentID, body.LeaseID, body.ASN, body.SourcePrefix, body.BlockCIDR, body.MaxBlocks, body.Blocks})
+		if r.URL.Path == "/api/agent/v1/claim" {
+			fmt.Fprint(w, `{"results":[{"sourcePrefix":"8.8.8.0/24","blockCidr":"8.8.8.0/24","state":"claimed","leaseId":"lease-token-1234567890"}],"examined":1}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"released":true}`)
+	}))
+	defer server.Close()
+	client, err := newClientWithAgentID(server.URL, "token", "machine-a", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := prefix.Block{ASN: 64512, SourcePrefix: "8.8.8.0/24", BlockCIDR: "8.8.8.0/24"}
+	claims, examined, err := client.ClaimBlocks(context.Background(), block.ASN, []prefix.Block{block}, 4)
+	if err != nil || examined != 1 || len(claims) != 1 || claims[0].Block.LeaseID != "lease-token-1234567890" {
+		t.Fatalf("ClaimBlocks() = (%#v, %d, %v)", claims, examined, err)
+	}
+	if err := client.ReleaseBlock(context.Background(), block, claims[0].Block.LeaseID); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[0].Path != "/api/agent/v1/claim" || requests[1].Path != "/api/agent/v1/release" {
+		t.Fatalf("lease paths = %#v", requests)
+	}
+	if requests[0].MaxBlocks != 4 {
+		t.Errorf("requested maxBlocks = %d, want 4", requests[0].MaxBlocks)
+	}
+	if len(requests[0].Blocks) != 1 || requests[0].Blocks[0] != (claimCandidate{SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR}) {
+		t.Errorf("claim candidates = %#v", requests[0].Blocks)
+	}
+	for _, request := range requests {
+		if request.Authorization != "Bearer token" || request.AgentID != "machine-a" || request.ASN != block.ASN {
+			t.Errorf("lease request = %#v", request)
+		}
+	}
+	if requests[1].LeaseID != claims[0].Block.LeaseID || requests[1].SourcePrefix != block.SourcePrefix || requests[1].BlockCIDR != block.BlockCIDR {
+		t.Errorf("release request = %#v", requests[1])
 	}
 }
 

@@ -12,6 +12,7 @@ type Block struct {
 	BlockCIDR    string  `json:"blockCidr"`
 	Status       string  `json:"status"`
 	LatestIP     *string `json:"latestIp"`
+	LeaseID      string  `json:"leaseId,omitempty"`
 }
 
 func SortBlocks(blocks []Block) error {

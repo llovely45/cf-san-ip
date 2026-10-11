@@ -189,7 +189,7 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if err := config.Save(app.ConfigPath, *cfg); err != nil {
 		return err
 	}
-	client, err := backend.NewClient(cfg.URL, cfg.Token)
+	client, err := backend.NewClient(cfg.URL, cfg.Token, cfg.AgentID)
 	if err != nil {
 		return err
 	}

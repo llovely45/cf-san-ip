@@ -40,6 +40,46 @@ const report = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+async function claimLease(
+  routes: ReturnType<typeof createAgentRoutes>,
+  options: { sourcePrefix?: string; blockCidr?: string; agentId?: string } = {},
+): Promise<{ agentId: string; leaseId: string }> {
+  const agentId = options.agentId ?? "test-agent";
+  const sourcePrefix = options.sourcePrefix ?? "8.8.8.0/24";
+  const blockCidr = options.blockCidr ?? "8.8.8.0/24";
+  const response = await request(routes, "/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ asn, agentId, maxBlocks: 1, blocks: [{ sourcePrefix, blockCidr }] }),
+  });
+  if (response.status !== 200) {
+    throw new Error(`lease claim failed with HTTP ${response.status}`);
+  }
+  const body = await response.json() as { results: Array<{ sourcePrefix: string; blockCidr: string; state: string; leaseId?: string }> };
+  const claimed = body.results[0];
+  if (claimed === undefined || claimed.state !== "claimed" || claimed.sourcePrefix !== sourcePrefix || claimed.blockCidr !== blockCidr || claimed.leaseId === undefined) {
+    throw new Error("test block was not claimable");
+  }
+  return { agentId, leaseId: claimed.leaseId };
+}
+
+async function postReport(
+  routes: ReturnType<typeof createAgentRoutes>,
+  overrides: Record<string, unknown> = {},
+  lease?: { agentId: string; leaseId: string },
+): Promise<Response> {
+  const payload = report(overrides);
+  const owner = lease ?? await claimLease(routes, {
+    sourcePrefix: String(payload.sourcePrefix),
+    blockCidr: String(payload.blockCidr),
+  });
+  return await request(routes, "/report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, ...owner }),
+  });
+}
+
 describe("agent plan and report API", () => {
   beforeEach(async () => {
     await db.prepare("DELETE FROM scan_blocks").run();
@@ -61,18 +101,14 @@ describe("agent plan and report API", () => {
       blockCheckpoints: [],
     });
 
-    const completed = await request(
-      routes,
-      "/report",
-      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report({ status: "completed", sourcePrefix: "8.8.8.0/23" })) },
-    );
+    const completed = await postReport(routes, { status: "completed", sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/23" });
     expect(completed.status).toBe(200);
     const second = await request(makeRoutes(["8.8.8.0/23", "8.8.9.0/24"]), `/plan?asn=${asn}`);
     const secondBody = await second.json() as { prefixes: string[]; checkpoints: Array<{ blockCidr: string; status: string }>; blockCheckpoints: Array<{ blockCidr: string; status: string }> };
     expect(secondBody.prefixes).toEqual(["8.8.8.0/23", "8.8.9.0/24"]);
     expect(secondBody.checkpoints).toEqual([]);
     expect(secondBody.blockCheckpoints).toEqual([
-      { sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/24", status: "completed", latestIp: null },
+      { sourcePrefix: "8.8.8.0/23", blockCidr: "8.8.8.0/23", status: "completed", latestIp: null },
     ]);
   });
 
@@ -95,14 +131,10 @@ describe("agent plan and report API", () => {
     const planned = await request(routes, `/plan?asn=${asn}`);
     expect(planned.status).toBe(200);
 
-    const response = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({
-        sourcePrefix: "8.8.0.0/14",
-        blockCidr: "8.8.0.0/16",
-        latestIp: "8.8.12.34",
-      })),
+    const response = await postReport(routes, {
+      sourcePrefix: "8.8.0.0/14",
+      blockCidr: "8.8.0.0/16",
+      latestIp: "8.8.12.34",
     });
 
     expect(response.status).toBe(200);
@@ -121,11 +153,7 @@ describe("agent plan and report API", () => {
       { blockCidr: "8.9.0.0/16", status: "completed" },
       { blockCidr: "8.10.0.0/16", status: "active" },
     ]) {
-      const response = await request(routes, "/report", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(report({ sourcePrefix: "8.8.0.0/14", ...block })),
-      });
+      const response = await postReport(routes, { sourcePrefix: "8.8.0.0/14", ...block });
       expect(response.status).toBe(200);
     }
 
@@ -138,18 +166,194 @@ describe("agent plan and report API", () => {
     ].sort((left, right) => left.blockCidr.localeCompare(right.blockCidr)));
   });
 
-  it("continues accepting legacy /24 progress during agent rollout", async () => {
+  it("leases a block to one agent and lets another claim it after release", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = async (agentId: string) => await request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId,
+        maxBlocks: 1,
+        blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
+      }),
+    });
+
+    const firstResponse = await claim("machine-a");
+    expect(firstResponse.status).toBe(200);
+    const first = (await firstResponse.json() as { results: Array<{ state: string; leaseId: string }> }).results[0];
+    expect(first?.state).toBe("claimed");
+    expect(first?.leaseId).toEqual(expect.any(String));
+
+    const competing = await claim("machine-b");
+    expect(competing.status).toBe(200);
+    expect(await competing.json()).toMatchObject({ results: [{ state: "leased" }], examined: 1 });
+
+    const released = await request(routes, "/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        sourcePrefix: "8.8.8.0/24",
+        blockCidr: "8.8.8.0/24",
+        agentId: "machine-a",
+        leaseId: first?.leaseId,
+      }),
+    });
+    expect(released.status).toBe(200);
+
+    const reacquiredResponse = await claim("machine-b");
+    const reacquired = (await reacquiredResponse.json() as { results: Array<{ state: string; leaseId: string }> }).results[0];
+    expect(reacquiredResponse.status).toBe(200);
+    expect(reacquired?.state).toBe("claimed");
+    expect(reacquired?.leaseId).toEqual(expect.any(String));
+    expect(reacquired?.leaseId).not.toBe(first?.leaseId);
+  });
+
+  it("allows only one machine to win simultaneous claims for the same block", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = (agentId: string) => request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId,
+        maxBlocks: 1,
+        blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
+      }),
+    });
+    const responses = await Promise.all([claim("machine-a"), claim("machine-b")]);
+    const bodies = await Promise.all(responses.map(async (response) => {
+      expect(response.status).toBe(200);
+      return await response.json() as { results: Array<{ state: string }> };
+    }));
+    const states = bodies.map((body) => body.results[0]?.state).sort();
+    expect(states).toEqual(["claimed", "leased"]);
+  });
+
+  it("distributes same-ASN blocks to different machines in ascending batches", async () => {
     const routes = makeRoutes(["8.8.0.0/14"]);
     await request(routes, `/plan?asn=${asn}`);
+    const claimNext = async (agentId: string, maxBlocks = 2) => {
+      const response = await request(routes, "/claim", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          asn,
+          agentId,
+          maxBlocks,
+          blocks: ["8.8.0.0/16", "8.9.0.0/16", "8.10.0.0/16", "8.11.0.0/16"].map((blockCidr) => ({
+            sourcePrefix: "8.8.0.0/14",
+            blockCidr,
+          })),
+        }),
+      });
+      expect(response.status).toBe(200);
+      return await response.json() as {
+        results: Array<{ sourcePrefix: string; blockCidr: string; state: string; leaseId?: string }>;
+        examined: number;
+      };
+    };
 
-    const response = await request(routes, "/report", {
+    const first = await claimNext("machine-a");
+    const second = await claimNext("machine-b");
+    expect(first.results.filter((item) => item.state === "claimed").map((block) => block.blockCidr)).toEqual(["8.8.0.0/16", "8.9.0.0/16"]);
+    expect(second.results.filter((item) => item.state === "claimed").map((block) => block.blockCidr)).toEqual(["8.10.0.0/16", "8.11.0.0/16"]);
+    expect(first.results.filter((item) => item.state === "claimed").every((block) => (block.leaseId?.length ?? 0) >= 16)).toBe(true);
+    expect(first.examined).toBe(2);
+    expect(second.examined).toBe(4);
+
+    const waiting = await claimNext("machine-c", 4);
+    expect(waiting.results.every((item) => item.state === "leased")).toBe(true);
+    expect(waiting.examined).toBe(4);
+  });
+
+  it("renews lease on checkpoint reports and rejects stale owners", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = await claimLease(routes, { agentId: "machine-a" });
+
+    const heartbeat = await request(routes, "/report", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(report({
-        sourcePrefix: "8.8.0.0/14",
-        blockCidr: "8.8.1.0/24",
-        latestIp: "8.8.1.34",
+        agentId: "machine-a",
+        leaseId: claim.leaseId,
+        latestIp: "8.8.8.9",
       })),
+    });
+    expect(heartbeat.status).toBe(200);
+    const progress = await db.prepare(
+      "SELECT latest_ip, lease_agent_id, lease_id, lease_expires_at FROM scan_block_progress WHERE asn = ?",
+    ).bind(asn).first<{ latest_ip: string; lease_agent_id: string; lease_id: string; lease_expires_at: string }>();
+    expect(progress).toMatchObject({ latest_ip: "8.8.8.9", lease_agent_id: "machine-a", lease_id: claim.leaseId });
+    expect(progress?.lease_expires_at).toBeTruthy();
+
+    const stale = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({
+        agentId: "machine-b",
+        leaseId: "stale-lease-identifier",
+        latestIp: "8.8.8.10",
+      })),
+    });
+    expect(stale.status).toBe(409);
+    expect(await db.prepare("SELECT latest_ip FROM scan_block_progress WHERE asn = ?")
+      .bind(asn).first()).toEqual({ latest_ip: "8.8.8.9" });
+  });
+
+  it("allows a new agent to claim a lease after its checkpoint timeout", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const claim = async (agentId: string) => await request(routes, "/claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        asn,
+        agentId,
+        maxBlocks: 1,
+        blocks: [{ sourcePrefix: "8.8.8.0/24", blockCidr: "8.8.8.0/24" }],
+      }),
+    });
+    const firstResponse = await claim("machine-a");
+    const first = (await firstResponse.json() as { results: Array<{ state: string; leaseId: string }> }).results[0];
+    expect(first?.state).toBe("claimed");
+    expect(first?.leaseId).toEqual(expect.any(String));
+    await db.prepare(
+      "UPDATE scan_block_progress SET lease_expires_at = datetime('now', '-1 second') WHERE asn = ?",
+    ).bind(asn).run();
+
+    const reclaimedResponse = await claim("machine-b");
+    const reclaimed = (await reclaimedResponse.json() as { results: Array<{ state: string; leaseId: string }> }).results[0];
+    expect(reclaimedResponse.status).toBe(200);
+    expect(reclaimed?.state).toBe("claimed");
+    expect(reclaimed?.leaseId).toEqual(expect.any(String));
+    expect(reclaimed?.leaseId).not.toBe(first?.leaseId);
+
+    const staleReport = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report({
+        agentId: "machine-a",
+        leaseId: first?.leaseId,
+        candidate: { ip: "8.8.8.10", port: 443, asn, region: "US" },
+      })),
+    });
+    expect(staleReport.status).toBe(409);
+    expect(await new D1IpRepository(db).getByIp("8.8.8.10")).toBeNull();
+  });
+
+  it("accepts /24 progress when the announced source prefix is that /24", async () => {
+    const routes = makeRoutes(["8.8.1.0/24"]);
+    await request(routes, `/plan?asn=${asn}`);
+
+    const response = await postReport(routes, {
+      sourcePrefix: "8.8.1.0/24",
+      blockCidr: "8.8.1.0/24",
+      latestIp: "8.8.1.34",
     });
 
     expect(response.status).toBe(200);
@@ -218,11 +422,7 @@ describe("agent plan and report API", () => {
   it("resets the cursor when the announced prefix set changes", async () => {
     const routes = makeRoutes(["8.8.8.0/24"]);
     await request(routes, `/plan?asn=${asn}`);
-    await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({ status: "completed" })),
-    });
+    await postReport(routes, { status: "completed" });
     const second = await request(makeRoutes(["8.8.7.0/24", "8.8.8.0/24", "8.8.9.0/24"]), `/plan?asn=${asn}`);
     expect(await second.json()).toEqual({
       asn,
@@ -241,17 +441,10 @@ describe("agent plan and report API", () => {
   it("does not regress a completed checkpoint when a stale active report arrives", async () => {
     const routes = makeRoutes();
     await request(routes, `/plan?asn=${asn}`);
-    await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({ status: "completed" })),
-    });
-    const stale = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({ status: "active", latestIp: "8.8.8.7" })),
-    });
-    expect(stale.status).toBe(200);
+    const lease = await claimLease(routes);
+    await postReport(routes, { status: "completed" }, lease);
+    const stale = await postReport(routes, { status: "active", latestIp: "8.8.8.7" }, lease);
+    expect(stale.status).toBe(409);
     expect(await db.prepare("SELECT status FROM scan_block_progress WHERE asn = ?")
       .bind(asn).first()).toMatchObject({ status: "completed" });
   });
@@ -276,18 +469,27 @@ describe("agent plan and report API", () => {
     expect((await request(routes, "/plan?asn=0")).status).toBe(400);
   });
 
+  it("requires an acquired lease for every scan checkpoint report", async () => {
+    const routes = makeRoutes();
+    await request(routes, `/plan?asn=${asn}`);
+    const response = await request(routes, "/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(report()),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "lease_required" });
+  });
+
   it("stores candidate plus completed checkpoint and rejects out-of-block candidates", async () => {
     const routes = makeRoutes();
     await request(routes, `/plan?asn=${asn}`);
-    const valid = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({
-        status: "completed",
-        latestIp: "8.8.8.3",
-        candidate: { ip: "8.8.8.3", port: 443, asn, region: "US" },
-      })),
-    });
+    const lease = await claimLease(routes);
+    const valid = await postReport(routes, {
+      status: "completed",
+      latestIp: "8.8.8.3",
+      candidate: { ip: "8.8.8.3", port: 443, asn, region: "US" },
+    }, lease);
     expect(valid.status).toBe(200);
     expect(await new D1IpRepository(db).getByIp("8.8.8.3")).toMatchObject({
       port: 443,
@@ -295,13 +497,9 @@ describe("agent plan and report API", () => {
       region: "US",
     });
 
-    const invalid = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({
-        candidate: { ip: "1.1.1.1", port: 443, asn, region: "US" },
-      })),
-    });
+    const invalid = await postReport(routes, {
+      candidate: { ip: "1.1.1.1", port: 443, asn, region: "US" },
+    }, lease);
     expect(invalid.status).toBe(400);
     expect(await new D1IpRepository(db).getByIp("1.1.1.1")).toBeNull();
   });
@@ -310,12 +508,8 @@ describe("agent plan and report API", () => {
     const routes = makeRoutes();
     await request(routes, `/plan?asn=${asn}`);
     await new D1IpRepository(db).upsert({ ip: "8.8.8.4", port: 443, asn, region: "CA", asnAlias: "DMIT" });
-    const response = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({
-        candidate: { ip: "8.8.8.4", port: 443, asn, region: "US" },
-      })),
+    const response = await postReport(routes, {
+      candidate: { ip: "8.8.8.4", port: 443, asn, region: "US" },
     });
     expect(response.status).toBe(200);
     expect(await new D1IpRepository(db).getByIp("8.8.8.4")).toMatchObject({
@@ -331,22 +525,14 @@ describe("agent plan and report API", () => {
   ])("rejects invalid candidates: %o", async ({ candidate }) => {
     const routes = makeRoutes();
     await request(routes, `/plan?asn=${asn}`);
-    const response = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({ candidate })),
-    });
+    const response = await postReport(routes, { candidate });
     expect(response.status).toBe(400);
   });
 
   it("only updates progress for a report without a candidate", async () => {
     const routes = makeRoutes();
     await request(routes, `/plan?asn=${asn}`);
-    const response = await request(routes, "/report", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(report({ latestIp: "8.8.8.7" })),
-    });
+    const response = await postReport(routes, { latestIp: "8.8.8.7" });
     expect(response.status).toBe(200);
     expect(await db.prepare("SELECT * FROM ip_records").all()).toMatchObject({ results: [] });
     expect(await db.prepare("SELECT latest_ip FROM scan_block_progress WHERE asn = ?").bind(asn).first()).toMatchObject({ latest_ip: "8.8.8.7" });

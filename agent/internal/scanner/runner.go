@@ -25,6 +25,11 @@ type Reporter interface {
 	Report(context.Context, backend.Report) error
 }
 
+type LeaseCoordinator interface {
+	ClaimBlocks(context.Context, uint32, []prefix.Block, uint32) ([]backend.BlockClaim, int, error)
+	ReleaseBlock(context.Context, prefix.Block, string) error
+}
+
 type TraceProber func(context.Context, string) (probe.TraceResponse, error)
 
 type RunnerConfig struct {
@@ -39,7 +44,11 @@ type RunnerConfig struct {
 	CPULimitCPUPercent uint64
 	CPULimitForeground bool
 	HeartbeatInterval  time.Duration
+	LeasePollInterval  time.Duration
 }
+
+const ForcedCheckpointInterval time.Duration = 10 * time.Minute
+const maxClaimCandidates int = 64
 
 // MaxConcurrentBlocks is the default upper bound for concurrent Masscan blocks.
 const MaxConcurrentBlocks uint32 = 4
@@ -82,7 +91,10 @@ func (r *Runner) normalizedConfig() RunnerConfig {
 		config.BlockWorkers = MaxConcurrentBlocks
 	}
 	if config.HeartbeatInterval <= 0 {
-		config.HeartbeatInterval = 10 * time.Minute
+		config.HeartbeatInterval = ForcedCheckpointInterval
+	}
+	if config.LeasePollInterval <= 0 {
+		config.LeasePollInterval = 30 * time.Second
 	}
 	return config
 }
@@ -107,6 +119,9 @@ func (r *Runner) RunPlan(ctx context.Context, plan *prefix.Plan) error {
 	if err != nil {
 		return err
 	}
+	if coordinator, ok := r.Reporter.(LeaseCoordinator); ok {
+		return r.runLeasedPlan(ctx, plan, config, coordinator)
+	}
 	batchSize := r.blockConcurrency(config)
 	batch := make([]prefix.Block, 0, batchSize)
 	if err := plan.ForEachPending(func(block prefix.Block) error {
@@ -126,6 +141,154 @@ func (r *Runner) RunPlan(ctx context.Context, plan *prefix.Plan) error {
 		return err
 	}
 	return r.runBlockBatch(ctx, plan.ASN(), batch, config)
+}
+
+func (r *Runner) runLeasedPlan(
+	ctx context.Context,
+	plan *prefix.Plan,
+	config RunnerConfig,
+	coordinator LeaseCoordinator,
+) error {
+	batchSize := r.blockConcurrency(config)
+	batch := make([]prefix.Block, 0, batchSize)
+	var retryBlocks []prefix.Block
+	runClaimedBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		current := append([]prefix.Block(nil), batch...)
+		batch = batch[:0]
+		if err := r.runBlockBatch(ctx, plan.ASN(), current, config); err != nil {
+			r.releaseClaimedBlocks(coordinator, current)
+			return err
+		}
+		return nil
+	}
+	processCandidates := func(candidates []prefix.Block) (pending []prefix.Block, claimedAny bool, err error) {
+		for len(candidates) > 0 {
+			if err := ctx.Err(); err != nil {
+				return pending, claimedAny, err
+			}
+			if len(batch) == batchSize {
+				if err := runClaimedBatch(); err != nil {
+					return pending, claimedAny, err
+				}
+			}
+			count := min(len(candidates), maxClaimCandidates)
+			group := candidates[:count]
+			remainingSlots := batchSize - len(batch)
+			outcomes, examined, err := coordinator.ClaimBlocks(ctx, plan.ASN(), group, uint32(remainingSlots))
+			if err != nil {
+				return pending, claimedAny, fmt.Errorf("cannot claim scan blocks: %w", err)
+			}
+			if examined < 1 || examined > len(group) || len(outcomes) != examined {
+				return pending, claimedAny, fmt.Errorf("backend returned an invalid scan block claim batch")
+			}
+			for index, outcome := range outcomes {
+				candidate := group[index]
+				switch outcome.State {
+				case "claimed":
+					block := outcome.Block
+					if block.ASN != 0 && block.ASN != plan.ASN() ||
+						block.SourcePrefix != candidate.SourcePrefix || block.BlockCIDR != candidate.BlockCIDR ||
+						strings.TrimSpace(block.LeaseID) == "" {
+						if block.LeaseID != "" {
+							r.releaseClaimedBlocks(coordinator, []prefix.Block{block})
+						}
+						return pending, claimedAny, fmt.Errorf("backend returned an invalid lease for block %s", candidate.BlockCIDR)
+					}
+					block.ASN = plan.ASN()
+					batch = append(batch, block)
+					claimedAny = true
+				case "leased":
+					pending = append(pending, candidate)
+				case "completed":
+				default:
+					return pending, claimedAny, fmt.Errorf("backend returned an invalid state for block %s", candidate.BlockCIDR)
+				}
+			}
+			candidates = candidates[examined:]
+			if len(batch) == batchSize {
+				if err := runClaimedBatch(); err != nil {
+					return pending, claimedAny, err
+				}
+			}
+		}
+		return pending, claimedAny, nil
+	}
+
+	var candidateWindow []prefix.Block
+	if err := plan.ForEachPending(func(block prefix.Block) error {
+		candidateWindow = append(candidateWindow, block)
+		if len(candidateWindow) < maxClaimCandidates {
+			return nil
+		}
+		pending, _, err := processCandidates(candidateWindow)
+		retryBlocks = append(retryBlocks, pending...)
+		candidateWindow = candidateWindow[:0]
+		return err
+	}); err != nil {
+		r.releaseClaimedBlocks(coordinator, batch)
+		return err
+	}
+	if len(candidateWindow) > 0 {
+		pending, _, err := processCandidates(candidateWindow)
+		retryBlocks = append(retryBlocks, pending...)
+		candidateWindow = nil
+		if err != nil {
+			r.releaseClaimedBlocks(coordinator, batch)
+			return err
+		}
+	}
+	if len(batch) > 0 {
+		if err := runClaimedBatch(); err != nil {
+			return err
+		}
+	}
+
+	for len(retryBlocks) > 0 {
+		var pending []prefix.Block
+		claimedAny := false
+		for start := 0; start < len(retryBlocks); start += maxClaimCandidates {
+			end := min(start+maxClaimCandidates, len(retryBlocks))
+			stillPending, claimed, err := processCandidates(retryBlocks[start:end])
+			pending = append(pending, stillPending...)
+			claimedAny = claimedAny || claimed
+			if err != nil {
+				r.releaseClaimedBlocks(coordinator, batch)
+				return err
+			}
+		}
+		if len(batch) > 0 {
+			if err := runClaimedBatch(); err != nil {
+				return err
+			}
+		}
+		retryBlocks = pending
+		if len(retryBlocks) == 0 {
+			return nil
+		}
+		if !claimedAny {
+			timer := time.NewTimer(config.LeasePollInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) releaseClaimedBlocks(coordinator LeaseCoordinator, blocks []prefix.Block) {
+	for _, block := range blocks {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := coordinator.ReleaseBlock(ctx, block, block.LeaseID); err != nil {
+			r.logf("ASN %d: could not release lease for unstarted block %s: %v\n", block.ASN, block.BlockCIDR, err)
+		}
+		cancel()
+	}
 }
 
 func (r *Runner) validateRun() (RunnerConfig, error) {
@@ -243,11 +406,20 @@ func (r *Runner) runBlock(
 	workerCount int,
 	aggregateLimit uint64,
 ) error {
+	coordinator, hasLeases := r.Reporter.(LeaseCoordinator)
+	blockCompleted := false
+	if hasLeases && block.LeaseID != "" {
+		defer func() {
+			if !blockCompleted {
+				r.releaseClaimedBlocks(coordinator, []prefix.Block{block})
+			}
+		}()
+	}
 	if err := parent.Err(); err != nil {
 		return err
 	}
 	progress := backend.Report{
-		ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR, Status: "active",
+		ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR, Status: "active", LeaseID: block.LeaseID,
 	}
 	if err := r.reportWithRetry(parent, progress); err != nil {
 		return fmt.Errorf("cannot mark scan block active: %w", err)
@@ -281,7 +453,7 @@ func (r *Runner) runBlock(
 			case <-ticker.C:
 				heartbeat := backend.Report{
 					ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR,
-					Status: "active", LatestIP: getLatestIP(),
+					Status: "active", LatestIP: getLatestIP(), LeaseID: block.LeaseID,
 				}
 				if err := r.reportWithRetry(blockCtx, heartbeat); err != nil {
 					select {
@@ -313,7 +485,7 @@ func (r *Runner) runBlock(
 		candidate := &backend.Candidate{IP: ip, Port: 443, ASN: asn, Region: region}
 		report := backend.Report{
 			ASN: asn, SourcePrefix: block.SourcePrefix, BlockCIDR: block.BlockCIDR,
-			Status: "active", LatestIP: ip, Candidate: candidate,
+			Status: "active", LatestIP: ip, LeaseID: block.LeaseID, Candidate: candidate,
 		}
 		if err := r.reportWithRetry(probeCtx, report); err != nil {
 			return fmt.Errorf("cannot persist valid scan result: %w", err)
@@ -347,6 +519,7 @@ func (r *Runner) runBlock(
 	if err := r.reportWithRetry(parent, progress); err != nil {
 		return fmt.Errorf("cannot mark scan block completed: %w", err)
 	}
+	blockCompleted = true
 	r.logf("ASN %d: completed block %s (source %s)\n", asn, block.BlockCIDR, block.SourcePrefix)
 	return nil
 }
