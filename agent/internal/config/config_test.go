@@ -86,6 +86,33 @@ func TestLoadMigratesLegacySendersToCurlWorkers(t *testing.T) {
 	}
 }
 
+func TestLoadCapsLegacySendersAtCurlWorkerLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{"url":"https://worker.example","token":"token","asn":64512,"limit":250,"senders":8192,"agentId":"legacy"}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() rejected a legacy config with more senders than the new worker limit: %v", err)
+	}
+	if cfg.CurlWorkers != 4096 {
+		t.Fatalf("legacy senders migrated to CurlWorkers = %d, want capped value 4096", cfg.CurlWorkers)
+	}
+
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"curlWorkers": 4096`) || strings.Contains(string(data), `"senders"`) {
+		t.Fatalf("legacy config was not rewritten with the capped worker count: %s", data)
+	}
+}
+
 func TestLoadStillRejectsUnknownConfigFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"url":"https://worker.example","token":"token","limit":100,"curlWorkers":10,"agentId":"id","unexpected":true}`), 0o600); err != nil {

@@ -23,6 +23,8 @@ type Config struct {
 	AgentID     string `json:"agentId"`
 }
 
+const maxCurlWorkers = 4096
+
 type Overrides struct {
 	URL         *string
 	Token       *string
@@ -59,6 +61,9 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 	workers := value.CurlWorkers
 	if workers == 0 && value.Senders != nil {
 		workers = *value.Senders
+		if workers > maxCurlWorkers {
+			workers = maxCurlWorkers
+		}
 	}
 	*cfg = Config{
 		URL:         value.URL,
@@ -96,7 +101,7 @@ func Validate(cfg Config) error {
 	if cfg.CurlWorkers == 0 {
 		return errors.New("curl worker count must be greater than zero")
 	}
-	if cfg.CurlWorkers > 4096 {
+	if cfg.CurlWorkers > maxCurlWorkers {
 		return errors.New("curl worker count cannot exceed 4096")
 	}
 	return nil

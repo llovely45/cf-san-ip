@@ -176,6 +176,20 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   grep -q '"limit": 250' /etc/cf-san/config.json || { echo 'update did not preserve Masscan rate' >&2; exit 1; }
   grep -q '"curlWorkers": 40' /etc/cf-san/config.json || { echo 'update did not preserve curl validation concurrency' >&2; exit 1; }
 
+  # Upgrading from the ZMap/ZGrab2 agent may encounter a legacy sender count
+  # above the new curl worker ceiling. The replacement binary must migrate and
+  # persist a usable capped value instead of failing configuration.
+  printf '%s\n' '{"url":"https://updated.example","token":"updated-token","asn":16509,"limit":250,"senders":8192,"agentId":"legacy-agent"}' > /etc/cf-san/config.json
+  legacy_update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
+    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+      printf '%s\n' "$legacy_update_output" >&2
+      exit 1
+    }
+  case "$legacy_update_output" in *'curl worker count cannot exceed'*) echo 'update rejected an over-limit legacy sender count' >&2; exit 1 ;; esac
+  grep -q '"curlWorkers": 4096' /etc/cf-san/config.json || { echo 'update did not cap legacy sender count at 4096' >&2; exit 1; }
+  if grep -q '"senders"' /etc/cf-san/config.json; then echo 'update did not migrate the legacy senders key' >&2; exit 1; fi
+  grep -q '"agentId": "legacy-agent"' /etc/cf-san/config.json || { echo 'update did not preserve the legacy Agent ID' >&2; exit 1; }
+
   # Existing Masscan installations may still be missing libpcap on Debian
   # Bookworm. Updating cf-san must repair that dependency even when the binary
   # is already present.
