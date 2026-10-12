@@ -20,7 +20,8 @@ const maxTraceBodyBytes = 64 * 1024
 const maxTraceResponseBytes = 80 * 1024
 
 // FetchCFTrace invokes curl for the selected public IP. Curl performs the TLS
-// handshake and the HTTP request together, so no separate TLS scanner is needed.
+// handshake and HTTP request together, with its default certificate-chain and
+// target-IP identity verification enabled.
 func FetchCFTrace(ctx context.Context, ip, curlPath string) (TraceResponse, error) {
 	address, err := netip.ParseAddr(ip)
 	if err != nil || !address.Is4() {
@@ -33,7 +34,6 @@ func FetchCFTrace(ctx context.Context, ip, curlPath string) (TraceResponse, erro
 	command := exec.CommandContext(ctx, curlPath,
 		"--silent",
 		"--show-error",
-		"--insecure",
 		"--include",
 		"--connect-timeout", "1",
 		"--max-time", "1",

@@ -39,10 +39,13 @@ func TestFetchCFTraceUsesCurlOnIPAndConventionalPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--silent", "--show-error", "--insecure", "--include", "--connect-timeout 1", "--max-time 1", "https://8.8.8.8:443/cdn-cgi/trace"} {
+	for _, want := range []string{"--silent", "--show-error", "--include", "--connect-timeout 1", "--max-time 1", "https://8.8.8.8:443/cdn-cgi/trace"} {
 		if !strings.Contains(string(args), want) {
 			t.Errorf("curl args %q do not contain %q", args, want)
 		}
+	}
+	if strings.Contains(string(args), "--insecure") {
+		t.Fatalf("curl args disable TLS certificate verification: %s", args)
 	}
 	if strings.Contains(string(args), "Authorization") || strings.Contains(string(args), "token") {
 		t.Fatalf("backend credentials appeared in curl args: %s", args)
