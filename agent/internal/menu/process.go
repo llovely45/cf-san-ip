@@ -1,6 +1,7 @@
 package menu
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var ErrAlreadyRunning = errors.New("cf-san scanner is already running")
@@ -159,6 +161,28 @@ func (m Manager) Stop() error {
 		return errors.New("cannot signal scanner process")
 	}
 	return nil
+}
+
+func (m Manager) WaitStopped(ctx context.Context, interval time.Duration) error {
+	if ctx == nil {
+		return errors.New("wait context must not be nil")
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		running, err := m.Status()
+		if err != nil || !running {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m Manager) RemoveIfCurrent(pid int) {
