@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [debian:bookworm-slim, debian:trixie-slim, alpine:3.23]
+        image: [debian:bookworm-slim, debian:trixie-slim, alpine:3.18, alpine:3.22, alpine:3.23]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

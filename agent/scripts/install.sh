@@ -72,6 +72,13 @@ ensure_debian_pcap() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y "$PCAP_PACKAGE"
 }
 
+ensure_alpine_pcap() {
+  command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
+  # Masscan 1.3.2 loads the unversioned libpcap.so name at runtime. Alpine's
+  # libpcap package only provides libpcap.so.1; the -dev package adds the link.
+  apk add --no-cache libpcap-dev
+}
+
 install_masscan() {
   [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
   # shellcheck disable=SC1091
@@ -86,7 +93,7 @@ install_masscan() {
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-      apk add --no-cache masscan cpulimit
+      apk add --no-cache masscan cpulimit libpcap-dev
       ;;
     *)
       fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
@@ -133,7 +140,7 @@ if [ "$UPDATE_ONLY" -eq 0 ]; then
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
-      apk add --no-cache ca-certificates curl coreutils tar gzip masscan cpulimit
+      apk add --no-cache ca-certificates curl coreutils tar gzip masscan cpulimit libpcap-dev
       ;;
     *)
       fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
@@ -155,6 +162,8 @@ else
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
       command -v dpkg-query >/dev/null 2>&1 || fail 'dpkg-query is required on Debian'
       ensure_debian_pcap
+    elif [ "${ID:-}" = alpine ]; then
+      ensure_alpine_pcap
     fi
   fi
 fi

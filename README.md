@@ -25,7 +25,7 @@ The tag workflow runs the full Worker, UI, Go, migration, and installer checks. 
 - `cf-san_linux_amd64.tar.gz` and its `.sha256` file
 - `cf-san_linux_arm64.tar.gz` and its `.sha256` file
 
-Each archive contains only the Go `cf-san` agent. The installer installs Masscan, `cpulimit`, and their runtime dependencies through the Debian or Alpine package manager, then verifies the agent archive SHA-256. On Debian, it explicitly installs or repairs the `libpcap` runtime needed by Masscan, including when updating an already-installed agent. The old bundled `zgrab2` binary and shared blocklist are removed when upgrading. Existing system-installed ZMap packages are not automatically purged, but the new agent no longer invokes or requires ZMap.
+Each archive contains only the Go `cf-san` agent. The installer installs Masscan, `cpulimit`, and their runtime dependencies through the Debian or Alpine package manager, then verifies the agent archive SHA-256. On Debian it explicitly installs or repairs Masscan's `libpcap` runtime, including the Bookworm/Trixie package-name difference. On Alpine it installs `libpcap-dev`: Masscan 1.3.2 loads the unversioned `libpcap.so` name, which is not provided by Alpine's runtime-only `libpcap` package. Both install and update paths ensure the correct package. The old bundled `zgrab2` binary and shared blocklist are removed when upgrading. Existing system-installed ZMap packages are not automatically purged, but the new agent no longer invokes or requires ZMap.
 
 ## Linux installation and menu
 
@@ -43,7 +43,7 @@ Run `sudo cf-san` to open the text menu. It supports:
 8. View the backend address, plaintext API token, ASN, PPS rate, CPU cap, curl concurrency, Agent ID, and process status.
 9. Change the backend HTTPS address.
 10. Change the API token.
-11. After pausing any active scan, fetch the current installer script from the configured Worker and install the latest GitHub Release of `cf-san`. If Masscan or `cpulimit` is missing, this update path installs it; on Debian it also repairs a missing `libpcap` runtime dependency.
+11. After pausing any active scan, fetch the current installer script from the configured Worker and install the latest GitHub Release of `cf-san`. If Masscan or `cpulimit` is missing, this update path installs it; it also repairs the required `libpcap` package on Debian and Alpine (including Alpine's unversioned linker name).
 12. Display the latest 100 lines from `/var/log/cf-san/agent.log`; use the shown `tail -f` command for live following.
 13. Exit. After updating, exit and run `sudo cf-san` again to load the new binary.
 

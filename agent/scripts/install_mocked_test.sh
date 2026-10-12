@@ -168,6 +168,7 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
     alpine)
       grep -q '^apk add --no-cache .*masscan' "$PACKAGE_LOG"
       grep -q '^apk add --no-cache .*cpulimit' "$PACKAGE_LOG"
+      grep -q '^apk add --no-cache .*libpcap-dev' "$PACKAGE_LOG" || { echo 'Alpine install did not include the libpcap.so linker name required by Masscan' >&2; exit 1; }
       ;;
     *) echo "unexpected container OS: ${ID:-unset}" >&2; exit 1 ;;
   esac
@@ -192,7 +193,7 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
       grep -q 'apt-get install -y .*cpulimit' "$PACKAGE_LOG"
       ;;
     alpine)
-      grep -q '^apk add --no-cache masscan cpulimit$' "$PACKAGE_LOG"
+      grep -q '^apk add --no-cache masscan cpulimit libpcap-dev$' "$PACKAGE_LOG"
       ;;
   esac
   grep -q '"url": "https://updated.example"' /etc/cf-san/config.json || { echo 'update did not save the new backend URL' >&2; exit 1; }
@@ -231,7 +232,8 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
       if grep -q 'apt-get install -y masscan' "$PACKAGE_LOG"; then echo 'update reinstalled an existing Masscan binary unnecessarily' >&2; exit 1; fi
       ;;
     alpine)
-      [ ! -s "$PACKAGE_LOG" ] || { echo 'Alpine updated packages unnecessarily when Masscan was already present' >&2; exit 1; }
+      grep -q '^apk add --no-cache libpcap-dev$' "$PACKAGE_LOG" || { echo 'Alpine update did not repair the Masscan libpcap.so linker name' >&2; exit 1; }
+      if grep -q 'apk add --no-cache masscan' "$PACKAGE_LOG"; then echo 'update reinstalled an existing Masscan binary unnecessarily' >&2; exit 1; fi
       ;;
   esac
 
