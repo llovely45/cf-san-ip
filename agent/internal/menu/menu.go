@@ -107,7 +107,11 @@ func (app *App) Run() error {
 			}
 		case "3":
 			if err := autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
-				return app.manager().Stop()
+				manager := app.manager()
+				if err := manager.Stop(); err != nil {
+					return err
+				}
+				return manager.ClearPendingResume()
 			}); err != nil {
 				fmt.Fprintf(app.Output, "暂停失败：%v\n", err)
 			} else {
@@ -242,7 +246,10 @@ func (app *App) start(cfg *config.Config) error {
 			return err
 		}
 		*cfg = fresh
-		return manager.Start()
+		if err := manager.Start(); err != nil {
+			return err
+		}
+		return manager.ClearPendingResume()
 	})
 }
 

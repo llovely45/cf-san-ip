@@ -17,6 +17,7 @@ const (
 
 	defaultShutdownTimeout = 2 * time.Minute
 	defaultPollInterval    = time.Second
+	defaultInstallTimeout  = 5 * time.Minute
 )
 
 // Scanner is the process lifecycle needed by the automatic updater.
@@ -48,8 +49,10 @@ type Runner struct {
 	Install         InstallerFunc
 	Logger          Logger
 	LockPath        string
+	ResumePath      string
 	ShutdownTimeout time.Duration
 	PollInterval    time.Duration
+	InstallTimeout  time.Duration
 }
 
 // Run performs one serialized automatic-update check.
@@ -79,6 +82,9 @@ func (r Runner) Run(ctx context.Context, cfg config.Config) error {
 func (r Runner) checkAndUpdate(ctx context.Context, cfg config.Config) error {
 	if err := r.validateIdentity(); err != nil {
 		return r.finish(UpdateRecord{CurrentVersion: r.CurrentVersion, Result: "disabled"}, cfg.Token, err)
+	}
+	if handled, err := r.recoverPendingResume(ctx, cfg); handled {
+		return err
 	}
 	if r.Releases == nil {
 		return r.finish(UpdateRecord{CurrentVersion: r.CurrentVersion, Result: "check-failed"}, cfg.Token, errors.New("release client is not configured"))
@@ -168,25 +174,90 @@ func (r Runner) checkAndUpdate(ctx context.Context, cfg config.Config) error {
 		}
 		return r.finishWithRecord(baseRecord, "install-failed", cfg.Token, err)
 	}
-	if err := r.Scanner.Start(); err != nil {
+	if err := r.markResumePending(); err != nil {
+		resumeErr := r.resumeScanner()
+		if resumeErr != nil {
+			err = fmt.Errorf("%w; scanner recovery failed: %v", err, resumeErr)
+		}
+		return r.finishWithRecord(baseRecord, "restart-failed", cfg.Token, err)
+	}
+	if err := r.resumeScanner(); err != nil {
 		return r.finishWithRecord(baseRecord, "restart-failed", cfg.Token, err)
 	}
 	return r.finishWithRecord(baseRecord, "updated", cfg.Token, nil)
 }
 
 func (r Runner) install(ctx context.Context, cfg config.Config, version string) error {
-	return r.Install(ctx, cfg, version, io.Discard)
+	installContext, cancel := context.WithTimeout(ctx, r.installTimeout())
+	defer cancel()
+	return r.Install(installContext, cfg, version, io.Discard)
 }
 
 func (r Runner) resumeAfterFailedInstall() error {
+	if err := r.markResumePending(); err != nil {
+		return err
+	}
+	return r.resumeScanner()
+}
+
+func (r Runner) recoverPendingResume(ctx context.Context, cfg config.Config) (bool, error) {
+	pending, err := HasPendingResume(r.resumePath())
+	if err != nil {
+		return true, r.finish(UpdateRecord{CurrentVersion: r.CurrentVersion, Result: "resume-failed"}, cfg.Token, err)
+	}
+	if !pending {
+		return false, nil
+	}
+	if r.Scanner == nil {
+		return true, r.finish(UpdateRecord{CurrentVersion: r.CurrentVersion, Result: "resume-failed"}, cfg.Token, errors.New("scanner is not configured"))
+	}
+	if err := ctx.Err(); err != nil {
+		return true, r.finish(UpdateRecord{CurrentVersion: r.CurrentVersion, Result: "resume-failed"}, cfg.Token, err)
+	}
+	if err := r.resumeScanner(); err != nil {
+		return true, r.finish(UpdateRecord{
+			CurrentVersion:  r.CurrentVersion,
+			WasRunningKnown: true,
+			Result:          "resume-failed",
+		}, cfg.Token, err)
+	}
+	return true, r.finish(UpdateRecord{
+		CurrentVersion:  r.CurrentVersion,
+		WasRunning:      true,
+		WasRunningKnown: true,
+		Result:          "resume-recovered",
+	}, cfg.Token, nil)
+}
+
+func (r Runner) markResumePending() error {
+	return SetPendingResume(r.resumePath())
+}
+
+func (r Runner) resumeScanner() error {
 	running, err := r.Scanner.Status()
 	if err != nil {
 		return err
 	}
-	if running {
-		return nil
+	if !running {
+		startErr := r.Scanner.Start()
+		confirmed, statusErr := r.Scanner.Status()
+		if statusErr != nil {
+			if startErr != nil {
+				return fmt.Errorf("%w; scanner status after start failed: %v", startErr, statusErr)
+			}
+			return fmt.Errorf("scanner status after start failed: %w", statusErr)
+		}
+		if !confirmed {
+			if startErr != nil {
+				return fmt.Errorf("%w; scanner is not running after start", startErr)
+			}
+			return errors.New("scanner is not running after start")
+		}
 	}
-	return r.Scanner.Start()
+	if err := ClearPendingResume(r.resumePath()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r Runner) validateIdentity() error {
@@ -211,6 +282,25 @@ func (r Runner) pollInterval() time.Duration {
 		return defaultPollInterval
 	}
 	return r.PollInterval
+}
+
+func (r Runner) installTimeout() time.Duration {
+	if r.InstallTimeout <= 0 {
+		return defaultInstallTimeout
+	}
+	return r.InstallTimeout
+}
+
+func (r Runner) resumePath() string {
+	if r.ResumePath == "" {
+		if provider, ok := r.Scanner.(interface{ PendingResumePath() string }); ok {
+			if path := provider.PendingResumePath(); path != "" {
+				return path
+			}
+		}
+		return DefaultResumeStatePath
+	}
+	return r.ResumePath
 }
 
 func (r Runner) finish(record UpdateRecord, token string, err error) error {

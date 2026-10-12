@@ -61,6 +61,37 @@ func TestManagerStartsStopsAndRejectsDuplicateRun(t *testing.T) {
 	t.Fatal("scanner is still running after pause signal")
 }
 
+func TestManagerStartRequiresTheChildToRemainRunning(t *testing.T) {
+	dir := t.TempDir()
+	manager := Manager{
+		Executable: "/bin/sh",
+		Arguments:  []string{"-c", "exit 0"},
+		RunDir:     filepath.Join(dir, "run"),
+		LogDir:     filepath.Join(dir, "log"),
+	}
+	if err := manager.Start(); err == nil {
+		t.Fatal("Start() returned nil after the child exited before startup confirmation")
+	}
+	if running, err := manager.Status(); err != nil || running {
+		t.Fatalf("Status() = (%v, %v), want stopped after failed startup", running, err)
+	}
+}
+
+func TestManagerRegistersForegroundProcess(t *testing.T) {
+	manager := Manager{
+		Executable: os.Args[0],
+		RunDir:     filepath.Join(t.TempDir(), "run"),
+		LogDir:     filepath.Join(t.TempDir(), "log"),
+	}
+	if err := manager.RegisterCurrent(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { manager.RemoveIfCurrent(os.Getpid()) })
+	if running, err := manager.Status(); err != nil || !running {
+		t.Fatalf("Status() = (%v, %v), want registered foreground process", running, err)
+	}
+}
+
 func TestManagerRemovesMalformedOrStalePIDFile(t *testing.T) {
 	runDir := t.TempDir()
 	manager := Manager{Executable: "/usr/local/bin/cf-san", RunDir: runDir, LogDir: t.TempDir()}

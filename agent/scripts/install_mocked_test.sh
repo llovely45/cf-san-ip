@@ -191,6 +191,14 @@ cat > "$STUB_DIR/curl" <<'STUB'
 set -eu
 output=
 last=
+curl_args=$*
+case " $curl_args " in
+  *"--proto =https"*"--proto-redir =https"*"--connect-timeout 15"*"--max-time 120"*"--retry-max-time 180"*) ;;
+  *)
+    printf '%s\n' 'curl fixture: missing HTTPS protocol restrictions' >&2
+    exit 97
+    ;;
+esac
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o)
@@ -206,7 +214,7 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$output" ] || exit 2
 name=${last##*/}
-printf '%s\n' "$last" >> "$CURL_LOG"
+printf 'curl %s\n' "$curl_args" >> "$CURL_LOG"
 cp "$CF_SAN_FIXTURE_DIR/$name" "$output"
 STUB
 cat > "$STUB_DIR/update-rc.d" <<'STUB'
@@ -311,6 +319,7 @@ assert_scheduler_files() {
       grep -Fxq '#!/bin/sh' "$PERIODIC_FILE" || fail 'Alpine daily job is not a shell script'
       ;;
   esac
+  grep -Fq 'auto-update --config /etc/cf-san/config.json' /usr/local/libexec/cf-san-auto-update || fail 'scheduler wrapper did not constrain the default config path'
   assert_no_credentials
 }
 

@@ -1,6 +1,7 @@
 package autoupdate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -90,9 +91,9 @@ func (client *GitHubClient) Latest(ctx context.Context, repository string) (Rele
 	}
 
 	var payload struct {
-		TagName    string `json:"tag_name"`
-		Draft      bool   `json:"draft"`
-		Prerelease bool   `json:"prerelease"`
+		TagName    string          `json:"tag_name"`
+		Draft      json.RawMessage `json:"draft"`
+		Prerelease json.RawMessage `json:"prerelease"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return Release{}, fmt.Errorf("GitHub release response is invalid JSON: %w", err)
@@ -100,16 +101,36 @@ func (client *GitHubClient) Latest(ctx context.Context, repository string) (Rele
 	if payload.TagName == "" {
 		return Release{}, errors.New("GitHub release response has an empty tag")
 	}
-	if payload.Draft {
+	draft, err := requiredJSONBool(payload.Draft, "draft")
+	if err != nil {
+		return Release{}, err
+	}
+	prerelease, err := requiredJSONBool(payload.Prerelease, "prerelease")
+	if err != nil {
+		return Release{}, err
+	}
+	if draft {
 		return Release{}, errors.New("GitHub release is a draft")
 	}
-	if payload.Prerelease {
+	if prerelease {
 		return Release{}, errors.New("GitHub release is a prerelease")
 	}
 	if _, err := buildinfo.CompareStableTags(payload.TagName, payload.TagName); err != nil {
 		return Release{}, fmt.Errorf("GitHub release tag is invalid: %w", err)
 	}
 	return Release{Version: payload.TagName}, nil
+}
+
+func requiredJSONBool(raw json.RawMessage, field string) (bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false, fmt.Errorf("GitHub release response field %q must be a boolean", field)
+	}
+	var value bool
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return false, fmt.Errorf("GitHub release response field %q must be a boolean: %w", field, err)
+	}
+	return value, nil
 }
 
 func readReleaseResponse(reader io.Reader) ([]byte, error) {

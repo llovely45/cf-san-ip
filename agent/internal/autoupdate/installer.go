@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"cf-san/internal/buildinfo"
@@ -20,6 +21,8 @@ import (
 const (
 	maxInstallerScriptBytes = 1 << 20
 	workerRequestTimeout    = 30 * time.Second
+	installerTimeout        = 5 * time.Minute
+	installerReapTimeout    = 2 * time.Second
 )
 
 // InstallFromWorker fetches and executes the installer served by the Worker.
@@ -36,12 +39,14 @@ func InstallFromWorker(ctx context.Context, cfg config.Config, version string, o
 		return err
 	}
 
+	installContext, cancel := context.WithTimeout(ctx, installerTimeout)
+	defer cancel()
 	client := &http.Client{Timeout: workerRequestTimeout}
-	script, err := loadInstallerScript(ctx, client, cfg.URL)
+	script, err := loadInstallerScript(installContext, client, cfg.URL)
 	if err != nil {
 		return err
 	}
-	return runInstallerScript(ctx, script, cfg, version, output, "sh")
+	return runInstallerScript(installContext, script, cfg, version, output, "sh")
 }
 
 func validateInstallerVersion(version string) error {
@@ -127,7 +132,10 @@ func runInstallerScript(ctx context.Context, script []byte, cfg config.Config, v
 	if version != "" {
 		args = append(args, "--version", version)
 	}
-	command := exec.CommandContext(ctx, shell, args...)
+	installContext, cancel := context.WithTimeout(ctx, installerTimeout)
+	defer cancel()
+	command := exec.Command(shell, args...)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Stdin = bytes.NewReader(script)
 	if output == nil {
 		output = io.Discard
@@ -138,10 +146,34 @@ func runInstallerScript(ctx context.Context, script []byte, cfg config.Config, v
 		"CF_SAN_BACKEND_URL": cfg.URL,
 		"CF_SAN_API_TOKEN":   cfg.Token,
 	})
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("update installer failed: %w", err)
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("update installer failed to start: %w", err)
 	}
-	return nil
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("update installer failed: %w", err)
+		}
+		return nil
+	case <-installContext.Done():
+		killProcessTree(command.Process)
+		select {
+		case <-done:
+		case <-time.After(installerReapTimeout):
+		}
+		return fmt.Errorf("update installer timed out: %w", installContext.Err())
+	}
+}
+
+func killProcessTree(process *os.Process) {
+	if process == nil {
+		return
+	}
+	if err := syscall.Kill(-process.Pid, syscall.SIGKILL); err != nil {
+		_ = process.Kill()
+	}
 }
 
 func replaceEnvironment(environment []string, overrides map[string]string) []string {

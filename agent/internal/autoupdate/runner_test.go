@@ -69,8 +69,8 @@ func TestRunnerStopsWaitsInstallsPinnedReleaseAndRestartsActiveScanner(t *testin
 	if installed != "v1.2.3" {
 		t.Fatalf("installed version = %q, want v1.2.3", installed)
 	}
-	if got := strings.Join(scanner.events, ","); got != "status,stop,wait,install:v1.2.3,start" {
-		t.Fatalf("events = %q, want status,stop,wait,install:v1.2.3,start", got)
+	if got := strings.Join(scanner.events, ","); got != "status,stop,wait,install:v1.2.3,status,start,status" {
+		t.Fatalf("events = %q, want status,stop,wait,install:v1.2.3,status,start,status", got)
 	}
 }
 
@@ -102,8 +102,93 @@ func TestRunnerResumesOnlyFormerlyActiveScannerAfterInstallFailure(t *testing.T)
 	if err := runner.Run(context.Background(), config.Config{}); !errors.Is(err, wantErr) {
 		t.Fatalf("Run() error = %v, want %v", err, wantErr)
 	}
-	if got := strings.Join(scanner.events, ","); got != "status,stop,wait,install:v1.2.3,status,start" {
+	if got := strings.Join(scanner.events, ","); got != "status,stop,wait,install:v1.2.3,status,start,status" {
 		t.Fatalf("events = %q, want recovery start after checking stopped state", got)
+	}
+}
+
+func TestRunnerPersistsResumeIntentWhenRestartFailsAndRetriesOnCurrentVersion(t *testing.T) {
+	resumePath := filepath.Join(t.TempDir(), "resume.pending")
+	startErr := errors.New("scanner did not start")
+	scanner := &fakeScanner{running: true, startErr: startErr}
+	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
+	runner.ResumePath = resumePath
+	runner.Install = func(_ context.Context, _ config.Config, _ string, _ io.Writer) error { return nil }
+
+	if err := runner.Run(context.Background(), config.Config{}); !errors.Is(err, startErr) {
+		t.Fatalf("Run() error = %v, want %v", err, startErr)
+	}
+	pending, err := HasPendingResume(resumePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("restart failure did not persist a pending resume intent")
+	}
+
+	scanner.startErr = nil
+	scanner.running = false
+	runner.CurrentVersion = "v1.2.3"
+	runner.Releases = fakeReleaseClient{release: Release{Version: "v1.2.3"}}
+	installCalls := 0
+	runner.Install = func(_ context.Context, _ config.Config, _ string, _ io.Writer) error {
+		installCalls++
+		return errors.New("pending recovery must not reinstall a current release")
+	}
+	if err := runner.Run(context.Background(), config.Config{}); err != nil {
+		t.Fatalf("Run() recovery error = %v", err)
+	}
+	if installCalls != 0 {
+		t.Fatalf("recovery installed %d times, want no install for current version", installCalls)
+	}
+	pending, err = HasPendingResume(resumePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("pending resume intent was not cleared after confirmed recovery")
+	}
+	if got := strings.Join(scanner.events[len(scanner.events)-3:], ","); got != "status,start,status" {
+		t.Fatalf("recovery events = %q, want status,start,status", got)
+	}
+}
+
+func TestRunnerDoesNotClearResumeIntentWhenStartReturnsWithoutRunning(t *testing.T) {
+	resumePath := filepath.Join(t.TempDir(), "resume.pending")
+	scanner := &fakeScanner{running: true, startLeavesStopped: true}
+	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
+	runner.ResumePath = resumePath
+	runner.Install = func(_ context.Context, _ config.Config, _ string, _ io.Writer) error { return nil }
+
+	if err := runner.Run(context.Background(), config.Config{}); err == nil {
+		t.Fatal("Run() error = nil, want unconfirmed restart failure")
+	}
+	pending, err := HasPendingResume(resumePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("unconfirmed restart did not retain pending resume intent")
+	}
+}
+
+func TestRunnerInstallerTimeoutResumesScannerAndReleasesUpdateLock(t *testing.T) {
+	scanner := &fakeScanner{running: true}
+	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
+	runner.InstallTimeout = 25 * time.Millisecond
+	runner.Install = func(ctx context.Context, _ config.Config, _ string, _ io.Writer) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	if err := runner.Run(context.Background(), config.Config{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want installer timeout", err)
+	}
+	if !strings.Contains(strings.Join(scanner.events, ","), "start") {
+		t.Fatalf("scanner events = %q, want recovery start after installer timeout", scanner.events)
+	}
+	if err := WithUpdateLock(runner.LockPath, func() error { return nil }); err != nil {
+		t.Fatalf("update lock was not released after installer timeout: %v", err)
 	}
 }
 
@@ -285,13 +370,15 @@ func (fake fakeReleaseClient) Latest(context.Context, string) (Release, error) {
 }
 
 type fakeScanner struct {
-	mu          sync.Mutex
-	running     bool
-	events      []string
-	waitErr     error
-	statusErr   error
-	waitBlocks  bool
-	waitStarted chan struct{}
+	mu                 sync.Mutex
+	running            bool
+	events             []string
+	waitErr            error
+	statusErr          error
+	waitBlocks         bool
+	waitStarted        chan struct{}
+	startErr           error
+	startLeavesStopped bool
 }
 
 func (fake *fakeScanner) Status() (bool, error) {
@@ -330,7 +417,12 @@ func (fake *fakeScanner) Start() error {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.events = append(fake.events, "start")
-	fake.running = true
+	if fake.startErr != nil {
+		return fake.startErr
+	}
+	if !fake.startLeavesStopped {
+		fake.running = true
+	}
 	return nil
 }
 
@@ -351,6 +443,7 @@ func newTestRunner(t *testing.T, current string, release Release, scanner *fakeS
 		Releases:        fakeReleaseClient{release: release},
 		Scanner:         scanner,
 		LockPath:        filepath.Join(t.TempDir(), "update.lock"),
+		ResumePath:      filepath.Join(t.TempDir(), "resume.pending"),
 		ShutdownTimeout: time.Second,
 		PollInterval:    time.Millisecond,
 	}

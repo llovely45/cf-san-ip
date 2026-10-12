@@ -84,13 +84,7 @@ func run(arguments []string) error {
 		fmt.Fprintln(os.Stdout, "配置已写入本机文件；文件权限为 0600，凭据仍以明文保存。")
 		return nil
 	case "run":
-		cfg, err := withConfigUpdateWait(options.configPath, options.overrides, func(cfg *config.Config) error {
-			return config.Save(options.configPath, *cfg)
-		})
-		if err != nil {
-			return err
-		}
-		return runScan(cfg, options.configPath)
+		return runForegroundScan(options)
 	case "auto-update":
 		manager := menu.NewManager()
 		manager.Arguments = []string{"run", "--config", options.configPath}
@@ -115,6 +109,10 @@ func runAutomaticUpdate(cfg config.Config, configPath string, scanner autoupdate
 	if err != nil {
 		return err
 	}
+	resumePath := ""
+	if provider, ok := scanner.(interface{ PendingResumePath() string }); ok {
+		resumePath = provider.PendingResumePath()
+	}
 	runner := autoupdate.Runner{
 		CurrentVersion: buildinfo.Version,
 		Repository:     buildinfo.Repository,
@@ -124,10 +122,47 @@ func runAutomaticUpdate(cfg config.Config, configPath string, scanner autoupdate
 		Install: func(ctx context.Context, installCfg config.Config, version string, output io.Writer) error {
 			return autoupdate.InstallFromWorker(ctx, installCfg, version, output)
 		},
-		Logger:   logger,
-		LockPath: updateLockPath,
+		Logger:     logger,
+		LockPath:   updateLockPath,
+		ResumePath: resumePath,
 	}
 	return runner.Run(context.Background(), cfg)
+}
+
+func runForegroundScan(options cliOptions) error {
+	manager := menu.NewManager()
+	managed := os.Getenv("CF_SAN_MANAGED_SCAN") == "1"
+	var cfg config.Config
+	loadAndRegister := func() error {
+		fresh, err := loadConfigOrDefaults(options.configPath)
+		if err != nil {
+			return err
+		}
+		fresh = config.MergeOverrides(fresh, options.overrides)
+		if err := config.Save(options.configPath, fresh); err != nil {
+			return err
+		}
+		if err := manager.RegisterCurrent(); err != nil {
+			return err
+		}
+		if !managed {
+			if err := manager.ClearPendingResume(); err != nil {
+				manager.RemoveIfCurrent(os.Getpid())
+				return err
+			}
+		}
+		cfg = fresh
+		return nil
+	}
+	if managed {
+		if err := loadAndRegister(); err != nil {
+			return err
+		}
+	} else if err := autoupdate.WithUpdateLock(updateLockPath, loadAndRegister); err != nil {
+		return err
+	}
+	defer manager.RemoveIfCurrent(os.Getpid())
+	return runScan(cfg, options.configPath, manager)
 }
 
 func withConfigUpdate(path string, overrides config.Overrides, update func(*config.Config) error) (config.Config, error) {
@@ -249,7 +284,7 @@ func parseOptions(arguments []string) (cliOptions, error) {
 	return options, nil
 }
 
-func runScan(cfg config.Config, configPath string) error {
+func runScan(cfg config.Config, configPath string, manager menu.Manager) error {
 	if err := config.ValidateForScan(cfg); err != nil {
 		return err
 	}
@@ -280,7 +315,6 @@ func runScan(cfg config.Config, configPath string) error {
 		"ASN %d: %d current source prefixes; scanning pending blocks in ascending batches (up to %d concurrent)\n",
 		cfg.ASN, plan.PrefixCount(), scanner.MaxConcurrentBlocks,
 	)
-	manager := menu.NewManager()
 	pid := os.Getpid()
 	defer manager.RemoveIfCurrent(pid)
 	runner := scanner.Runner{

@@ -8,8 +8,12 @@ import (
 	"syscall"
 )
 
+// ErrUpdateInProgress reports that another manual or automatic update owns
+// the shared update lock.
 var ErrUpdateInProgress = errors.New("cf-san update is already in progress")
 
+// WithUpdateLock runs fn while holding the shared update lock, returning
+// ErrUpdateInProgress instead of waiting for another updater.
 func WithUpdateLock(path string, fn func() error) error {
 	return withUpdateLock(path, fn, false)
 }

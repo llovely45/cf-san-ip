@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"cf-san/internal/autoupdate"
 	"cf-san/internal/config"
 )
 
@@ -35,6 +36,30 @@ func TestVersionCommandDoesNotReadConfig(t *testing.T) {
 			t.Fatalf("version command read missing config: %v", err)
 		}
 		t.Fatalf("version command error = %v", err)
+	}
+}
+
+func TestForegroundRunDoesNotWaitForAnActiveUpdate(t *testing.T) {
+	lockPath := useTestUpdateLockPath(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- autoupdate.WithUpdateLock(lockPath, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	err := run([]string{"run", "--config", filepath.Join(t.TempDir(), "config.json")})
+	if !errors.Is(err, autoupdate.ErrUpdateInProgress) {
+		t.Fatalf("foreground run error = %v, want ErrUpdateInProgress without waiting", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("update lock holder error = %v", err)
 	}
 }
 

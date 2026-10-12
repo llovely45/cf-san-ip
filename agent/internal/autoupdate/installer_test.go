@@ -3,11 +3,17 @@ package autoupdate
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"cf-san/internal/config"
 )
@@ -146,6 +152,35 @@ func TestRunInstallerScriptLeavesManualUpdateUnpinned(t *testing.T) {
 	if !strings.Contains(output.String(), "latest-update") {
 		t.Fatalf("installer output = %q", output.String())
 	}
+}
+
+func TestRunInstallerScriptTimeoutKillsInstallerProcessTree(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "child.pid")
+	t.Setenv("CF_SAN_TEST_CHILD_PID_FILE", pidPath)
+	script := "sleep 30 & child=$!; printf '%s' \"$child\" > \"$CF_SAN_TEST_CHILD_PID_FILE\"; wait \"$child\""
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	err := runInstallerScript(ctx, []byte(script), config.Config{}, "", io.Discard, "/bin/sh")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runInstallerScript() error = %v, want context deadline exceeded", err)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("child installer did not record its PID: %v", err)
+	}
+	childPID, err := strconv.Atoi(string(data))
+	if err != nil || childPID <= 0 {
+		t.Fatalf("child installer PID = %q, error = %v", data, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(childPID, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed-out installer child PID %d is still running", childPID)
 }
 
 func TestInstallFromWorkerRejectsInvalidVersionBeforeDownload(t *testing.T) {

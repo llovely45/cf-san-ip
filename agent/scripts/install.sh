@@ -163,7 +163,7 @@ case "$raw" in
 esac
 delay=$((raw % 1801))
 sleep "$delay"
-exec /usr/local/bin/cf-san auto-update
+exec /usr/local/bin/cf-san auto-update --config /etc/cf-san/config.json
 WRAPPER
   if ! install -m 0750 "$WRAPPER_SOURCE" /usr/local/libexec/cf-san-auto-update; then
     fail 'cannot install the cf-san scheduler wrapper'
@@ -327,8 +327,12 @@ if [ -n "$UPDATE_VERSION" ]; then
 else
   BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/latest/download"
 fi
-curl --fail --silent --show-error --location --retry 3 "${BASE_URL}/${ARCHIVE}" -o "${TEMP_DIR}/${ARCHIVE}"
-curl --fail --silent --show-error --location --retry 3 "${BASE_URL}/${ARCHIVE}.sha256" -o "${TEMP_DIR}/${ARCHIVE}.sha256"
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  --connect-timeout 15 --max-time 120 --retry 3 --retry-max-time 180 \
+  "${BASE_URL}/${ARCHIVE}" -o "${TEMP_DIR}/${ARCHIVE}"
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  --connect-timeout 15 --max-time 120 --retry 3 --retry-max-time 180 \
+  "${BASE_URL}/${ARCHIVE}.sha256" -o "${TEMP_DIR}/${ARCHIVE}.sha256"
 EXPECTED_SHA=$(awk 'NR == 1 { print $1 }' "${TEMP_DIR}/${ARCHIVE}.sha256")
 printf '%s\n' "$EXPECTED_SHA" | grep -Eq '^[A-Fa-f0-9]{64}$' || fail 'release checksum file is invalid'
 ACTUAL_SHA=$(sha256sum "${TEMP_DIR}/${ARCHIVE}" | awk '{ print $1 }')

@@ -298,6 +298,7 @@ func TestRunnerUsesRealManagerLifecycleWithExactRunConfigArguments(t *testing.T)
 		Releases:        integrationReleaseClient{},
 		Scanner:         manager,
 		LockPath:        lockPath,
+		ResumePath:      filepath.Join(dir, "resume.pending"),
 		ShutdownTimeout: 5 * time.Second,
 		PollInterval:    5 * time.Millisecond,
 		Install: func(_ context.Context, installCfg config.Config, version string, _ io.Writer) error {
@@ -402,6 +403,40 @@ func TestMenuStartUsesSharedUpdateLockBeforeScannerStart(t *testing.T) {
 	close(release)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first lock holder error = %v", err)
+	}
+}
+
+func TestMenuPauseClearsPendingAutomaticResumeIntent(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	resumePath := filepath.Join(dir, "resume.pending")
+	if err := config.Save(configPath, config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, AgentID: "id"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := autoupdate.SetPendingResume(resumePath); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		RunDir:          filepath.Join(dir, "run"),
+		LogDir:          filepath.Join(dir, "log"),
+		ResumeStatePath: resumePath,
+	}
+	app := &App{
+		ConfigPath:     configPath,
+		Manager:        manager,
+		Input:          strings.NewReader("3\n13\n"),
+		Output:         &bytes.Buffer{},
+		UpdateLockPath: filepath.Join(dir, "update.lock"),
+	}
+	if err := app.Run(); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := autoupdate.HasPendingResume(resumePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("manual pause left the automatic resume intent in place")
 	}
 }
 

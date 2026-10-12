@@ -5,6 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 INSTALLER="$SCRIPT_DIR/install.sh"
 MOCKED_INSTALLER_TEST="$SCRIPT_DIR/install_mocked_test.sh"
 WORKFLOW="$SCRIPT_DIR/../../.github/workflows/agent-release.yml"
+RELEASE_REF_VALIDATOR="$SCRIPT_DIR/validate_release_ref.sh"
 
 fail() {
   printf 'installer test failed: %s\n' "$1" >&2
@@ -15,6 +16,8 @@ sh -n "$INSTALLER" || fail 'installer has invalid POSIX shell syntax'
 bash -n "$INSTALLER" || fail 'installer has invalid Bash-compatible syntax'
 sh -n "$MOCKED_INSTALLER_TEST" || fail 'mocked installer test has invalid POSIX shell syntax'
 bash -n "$MOCKED_INSTALLER_TEST" || fail 'mocked installer test has invalid Bash-compatible syntax'
+[ -f "$RELEASE_REF_VALIDATOR" ] || fail 'release reference validator is missing'
+sh -n "$RELEASE_REF_VALIDATOR" || fail 'release reference validator has invalid POSIX shell syntax'
 
 HELP_OUTPUT=$(sh "$INSTALLER" --help 2>&1) || fail '--help did not succeed'
 printf '%s' "$HELP_OUTPUT" | grep -q 'Usage:' || fail '--help omitted usage'
@@ -50,6 +53,17 @@ for version in latest v1.2.3v v1.2.3suffix v1.2.3-rc.1 v1.02.3 v1.2 v1.2.3+build
     --url https://worker.example --token 'token-must-not-leak' --update-only --version "$version"
 done
 
+sh "$RELEASE_REF_VALIDATOR" push tag v1.2.3 || fail 'stable release tag was rejected'
+sh "$RELEASE_REF_VALIDATOR" workflow_dispatch branch main || fail 'workflow_dispatch on a branch was rejected'
+for invalid_tag in v1.2.3-rc.1 v1.2 v1.02.3 v1.2.3+build; do
+  if sh "$RELEASE_REF_VALIDATOR" push tag "$invalid_tag" >/dev/null 2>&1; then
+    fail "non-stable release tag was accepted: $invalid_tag"
+  fi
+done
+if sh "$RELEASE_REF_VALIDATOR" push branch main >/dev/null 2>&1; then
+  fail 'push branch reference was accepted as a release'
+fi
+
 embedded_newline_version=$(printf 'v1.2.3\ninvalid')
 expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
   --url https://worker.example --token 'token-must-not-leak' --update-only --version "$embedded_newline_version"
@@ -67,6 +81,14 @@ grep -Fq 'systemctl enable --now cron' "$INSTALLER" || fail 'installer lost the 
 grep -Fq 'update-rc.d cron defaults' "$INSTALLER" || fail 'installer lost the Debian non-systemd activation path'
 grep -Fq 'rc-update add crond default' "$INSTALLER" || fail 'installer lost the Alpine OpenRC activation path'
 grep -Fq 'detect_supported_os' "$INSTALLER" || fail 'installer does not validate the supported OS before update-only work'
+grep -Fq -- "--proto '=https'" "$INSTALLER" || fail 'archive downloads do not enforce HTTPS protocols'
+grep -Fq -- "--proto-redir '=https'" "$INSTALLER" || fail 'archive redirects do not enforce HTTPS protocols'
+grep -Fq -- '--connect-timeout 15' "$INSTALLER" || fail 'archive downloads do not enforce a connect timeout'
+grep -Fq -- '--max-time 120' "$INSTALLER" || fail 'archive downloads do not enforce an overall timeout'
+grep -Fq -- '--retry-max-time 180' "$INSTALLER" || fail 'archive retries do not enforce a finite retry window'
+grep -Fq 'validate_release_ref.sh' "$WORKFLOW" || fail 'release workflow lost the stable-tag gate'
+grep -Fq 'GITHUB_EVENT_NAME' "$WORKFLOW" || fail 'release workflow stable-tag gate is not event-aware'
+grep -Fq 'auto-update --config /etc/cf-san/config.json' "$INSTALLER" || fail 'scheduled updater is not constrained to the default config path'
 [ -f "$WORKFLOW" ] || fail 'agent release workflow is missing'
 grep -Fq -- '-e CF_SAN_MOCKED_TEST_IN_CONTAINER=1' "$WORKFLOW" || fail 'workflow did not mark the mocked test as running in a container'
 grep -Fq '"$CONTAINER_IMAGE" /bin/sh /repo/scripts/install_mocked_test.sh' "$WORKFLOW" || fail 'workflow lost the mocked installer test command'

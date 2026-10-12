@@ -100,6 +100,34 @@ func TestGitHubClientLatestRejectsInvalidReleasePayload(t *testing.T) {
 	}
 }
 
+func TestGitHubClientLatestRequiresBooleanReleaseFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing draft", body: `{"tag_name":"v1.2.3","prerelease":false}`},
+		{name: "null draft", body: `{"tag_name":"v1.2.3","draft":null,"prerelease":false}`},
+		{name: "string draft", body: `{"tag_name":"v1.2.3","draft":"false","prerelease":false}`},
+		{name: "number draft", body: `{"tag_name":"v1.2.3","draft":0,"prerelease":false}`},
+		{name: "missing prerelease", body: `{"tag_name":"v1.2.3","draft":false}`},
+		{name: "null prerelease", body: `{"tag_name":"v1.2.3","draft":false,"prerelease":null}`},
+		{name: "string prerelease", body: `{"tag_name":"v1.2.3","draft":false,"prerelease":"false"}`},
+		{name: "number prerelease", body: `{"tag_name":"v1.2.3","draft":false,"prerelease":0}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+
+			if _, err := newTestGitHubClient(server).Latest(context.Background(), "octo-org/cf-san"); err == nil {
+				t.Fatal("Latest() error = nil, want fail-closed boolean validation")
+			}
+		})
+	}
+}
+
 func TestGitHubClientLatestRejectsOversizedResponse(t *testing.T) {
 	body := `{"tag_name":"v1.2.3","draft":false,"prerelease":false,"body":"` + strings.Repeat("x", 2<<20) + `"}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
