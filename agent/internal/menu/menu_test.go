@@ -1,20 +1,55 @@
 package menu
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"cf-san/internal/autoupdate"
 	"cf-san/internal/config"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("CF_SAN_MENU_MANAGER_HELPER") == "1" {
+		managerHelperProcess()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func managerHelperProcess() {
+	eventsPath := os.Getenv("CF_SAN_MENU_MANAGER_EVENTS")
+	if eventsPath != "" {
+		file, err := os.OpenFile(eventsPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = file.WriteString(strings.Join(os.Args[1:], "\x1f") + "\n")
+			_ = file.Close()
+		}
+	}
+	waitForUpdateLock := func() error {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+		<-signals
+		return nil
+	}
+	if os.Getenv("CF_SAN_MENU_MANAGER_WAIT_FOR_LOCK") == "1" {
+		if err := autoupdate.WithUpdateLockWait(os.Getenv("CF_SAN_MENU_MANAGER_LOCK"), waitForUpdateLock); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	waitForUpdateLock()
+}
 
 func TestPrintStatusDisplaysConfiguredToken(t *testing.T) {
 	var output bytes.Buffer
@@ -166,6 +201,177 @@ func TestMenuManualUpdateUsesSharedUpdateLock(t *testing.T) {
 	}
 }
 
+func TestMenuSettingReloadsFreshConfigBeforeApplyingChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := config.Config{URL: "https://old.example", Token: "old-token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "old-agent"}
+	fresh := config.Config{URL: "https://new.example", Token: "new-token", ASN: 64512, Limit: 200, CurlWorkers: 40, MasscanCPUPercent: 45, AgentID: "new-agent"}
+	if err := config.Save(path, initial); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(t.TempDir(), "update.lock")
+	app := &App{ConfigPath: path, Output: &bytes.Buffer{}, UpdateLockPath: lockPath}
+	cfg := initial
+	if err := config.Save(path, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.updateSetting(bufio.NewReader(strings.NewReader("250\n")), &cfg, "4"); err != nil {
+		t.Fatalf("updateSetting() error = %v", err)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != fresh.URL || got.Token != fresh.Token || got.ASN != fresh.ASN || got.Limit != 250 || got.CurlWorkers != fresh.CurlWorkers || got.MasscanCPUPercent != fresh.MasscanCPUPercent || got.AgentID != fresh.AgentID {
+		t.Fatalf("saved config = %#v, want fresh values with only limit changed", got)
+	}
+	if cfg != got {
+		t.Fatalf("caller config = %#v, want synchronized config %#v", cfg, got)
+	}
+}
+
+func TestMenuManualUpdateReloadsFreshConfigBeforeRunning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := config.Config{URL: "https://old.example", Token: "old-token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "old-agent"}
+	fresh := config.Config{URL: "https://new.example", Token: "new-token", ASN: 64512, Limit: 200, CurlWorkers: 40, MasscanCPUPercent: 45, AgentID: "new-agent"}
+	if err := config.Save(path, initial); err != nil {
+		t.Fatal(err)
+	}
+	var received config.Config
+	lockPath := filepath.Join(t.TempDir(), "update.lock")
+	app := &App{
+		ConfigPath:     path,
+		Manager:        &Manager{RunDir: filepath.Join(t.TempDir(), "run")},
+		Output:         &bytes.Buffer{},
+		UpdateLockPath: lockPath,
+		updateAgent: func(_ context.Context, cfg config.Config, _ io.Writer) error {
+			received = cfg
+			return nil
+		},
+	}
+	cfg := initial
+	if err := config.Save(path, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.updateLatest(&cfg); err != nil {
+		t.Fatalf("updateLatest() error = %v", err)
+	}
+	if received != fresh {
+		t.Fatalf("updater received config %#v, want fresh %#v", received, fresh)
+	}
+	if cfg != fresh {
+		t.Fatalf("caller config = %#v, want synchronized config %#v", cfg, fresh)
+	}
+}
+
+func TestRunnerUsesRealManagerLifecycleWithExactRunConfigArguments(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	cfg := config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "agent"}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(dir, "events.log")
+	lockPath := filepath.Join(dir, "update.lock")
+	t.Setenv("CF_SAN_MENU_MANAGER_HELPER", "1")
+	t.Setenv("CF_SAN_MENU_MANAGER_EVENTS", eventsPath)
+	t.Setenv("CF_SAN_MENU_MANAGER_LOCK", lockPath)
+	manager := &Manager{
+		Executable: os.Args[0],
+		Arguments:  []string{"run", "--config", configPath},
+		RunDir:     filepath.Join(dir, "run"),
+		LogDir:     filepath.Join(dir, "log"),
+	}
+	t.Cleanup(func() {
+		_ = manager.Stop()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = manager.WaitStopped(ctx, 5*time.Millisecond)
+		cancel()
+	})
+	if err := manager.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitForManagerEvents(t, eventsPath, 1)
+
+	runner := autoupdate.Runner{
+		CurrentVersion:  "v1.2.2",
+		Repository:      "owner/repo",
+		Releases:        integrationReleaseClient{},
+		Scanner:         manager,
+		LockPath:        lockPath,
+		ShutdownTimeout: 5 * time.Second,
+		PollInterval:    5 * time.Millisecond,
+		Install: func(_ context.Context, installCfg config.Config, version string, _ io.Writer) error {
+			if installCfg != cfg {
+				t.Fatalf("installer received config %#v, want %#v", installCfg, cfg)
+			}
+			running, err := manager.Status()
+			if err != nil {
+				return err
+			}
+			if running {
+				t.Fatal("installer ran before real Manager confirmed scanner stopped")
+			}
+			appendManagerEvent(t, eventsPath, "install:"+version)
+			t.Setenv("CF_SAN_MENU_MANAGER_WAIT_FOR_LOCK", "1")
+			return nil
+		},
+	}
+	if err := runner.Run(context.Background(), cfg); err != nil {
+		t.Fatalf("Runner.Run() error = %v", err)
+	}
+	running, err := manager.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !running {
+		t.Fatal("real Manager did not restart scanner")
+	}
+	lines := waitForManagerEvents(t, eventsPath, 3)
+	expectedStart := strings.Join([]string{"run", "--config", configPath}, "\x1f")
+	expected := []string{expectedStart, "install:v1.2.3", expectedStart}
+	if strings.Join(lines, "\n") != strings.Join(expected, "\n") {
+		t.Fatalf("manager lifecycle events = %#v, want %#v", lines, expected)
+	}
+}
+
+type integrationReleaseClient struct{}
+
+func (integrationReleaseClient) Latest(context.Context, string) (autoupdate.Release, error) {
+	return autoupdate.Release{Version: "v1.2.3"}, nil
+}
+
+func appendManagerEvent(t *testing.T, path, event string) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(event + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForManagerEvents(t *testing.T, path string, count int) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+			if len(lines) >= count {
+				return lines
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d manager events in %s", count, path)
+	return nil
+}
+
 func TestMenuStartUsesSharedUpdateLockBeforeScannerStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "update.lock")
 	entered := make(chan struct{})
@@ -207,9 +413,10 @@ func TestMenuCanChangeBackendURLAndToken(t *testing.T) {
 	}
 	var output bytes.Buffer
 	app := &App{
-		ConfigPath: path,
-		Input:      strings.NewReader("9\nhttps://new-worker.example/\n10\nnew-token\n8\n13\n"),
-		Output:     &output,
+		ConfigPath:     path,
+		Input:          strings.NewReader("9\nhttps://new-worker.example/\n10\nnew-token\n8\n13\n"),
+		Output:         &output,
+		UpdateLockPath: filepath.Join(t.TempDir(), "update.lock"),
 	}
 	if err := app.Run(); err != nil {
 		t.Fatal(err)
@@ -233,9 +440,10 @@ func TestMenuCanChangeMasscanTotalCPUPercent(t *testing.T) {
 	}
 	var output bytes.Buffer
 	app := &App{
-		ConfigPath: path,
-		Input:      strings.NewReader("6\n45\n8\n13\n"),
-		Output:     &output,
+		ConfigPath:     path,
+		Input:          strings.NewReader("6\n45\n8\n13\n"),
+		Output:         &output,
+		UpdateLockPath: filepath.Join(t.TempDir(), "update.lock"),
 	}
 	if err := app.Run(); err != nil {
 		t.Fatal(err)

@@ -18,12 +18,17 @@ func TestRunnerDoesNotTouchScannerWhenReleaseIsNotNewer(t *testing.T) {
 		t.Run(version, func(t *testing.T) {
 			scanner := &fakeScanner{}
 			runner := newTestRunner(t, "v1.2.2", Release{Version: version}, scanner)
+			logger := &fakeLogger{}
+			runner.Logger = logger
 
 			if err := runner.Run(context.Background(), config.Config{}); err != nil {
 				t.Fatalf("Run() error = %v", err)
 			}
 			if got := strings.Join(scanner.events, ","); got != "" {
 				t.Fatalf("scanner events = %q, want no lifecycle calls", got)
+			}
+			if len(logger.records) != 1 || logger.records[0].WasRunningKnown {
+				t.Fatalf("no-update record = %#v, want unknown scan state", logger.records)
 			}
 		})
 	}
@@ -34,12 +39,17 @@ func TestRunnerDoesNotStopScannerWhenReleaseLookupFails(t *testing.T) {
 	scanner := &fakeScanner{running: true}
 	runner := newTestRunner(t, "v1.2.2", Release{}, scanner)
 	runner.Releases = fakeReleaseClient{err: wantErr}
+	logger := &fakeLogger{}
+	runner.Logger = logger
 
 	if err := runner.Run(context.Background(), config.Config{}); !errors.Is(err, wantErr) {
 		t.Fatalf("Run() error = %v, want %v", err, wantErr)
 	}
 	if got := strings.Join(scanner.events, ","); got != "" {
 		t.Fatalf("scanner events = %q, want no lifecycle calls", got)
+	}
+	if len(logger.records) != 1 || logger.records[0].WasRunningKnown {
+		t.Fatalf("lookup-failure record = %#v, want unknown scan state", logger.records)
 	}
 }
 
@@ -98,24 +108,96 @@ func TestRunnerResumesOnlyFormerlyActiveScannerAfterInstallFailure(t *testing.T)
 }
 
 func TestRunnerDoesNotInstallOrRestartAfterShutdownTimeout(t *testing.T) {
-	scanner := &fakeScanner{running: true, waitErr: context.DeadlineExceeded}
+	waitStarted := make(chan struct{})
+	scanner := &fakeScanner{running: true, waitBlocks: true, waitStarted: waitStarted}
 	installed := false
 	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
-	runner.ShutdownTimeout = 10 * time.Millisecond
+	runner.ShutdownTimeout = 25 * time.Millisecond
 	runner.PollInterval = time.Millisecond
 	runner.Install = func(_ context.Context, _ config.Config, _ string, _ io.Writer) error {
 		installed = true
 		return nil
 	}
 
+	startedAt := time.Now()
 	if err := runner.Run(context.Background(), config.Config{}); err == nil {
 		t.Fatal("Run() error = nil, want shutdown timeout")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run() error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < runner.ShutdownTimeout {
+		t.Fatalf("Run() returned after %s, want it to wait for the shutdown deadline", elapsed)
 	}
 	if installed {
 		t.Fatal("installer ran after shutdown timeout")
 	}
 	if got := strings.Join(scanner.events, ","); got != "status,stop,wait" {
 		t.Fatalf("events = %q, want no install or restart after timeout", got)
+	}
+}
+
+func TestRunnerDistinguishesNonTimeoutShutdownFailure(t *testing.T) {
+	wantErr := errors.New("scanner wait failed")
+	scanner := &fakeScanner{running: true, waitErr: wantErr}
+	logger := &fakeLogger{}
+	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
+	runner.Logger = logger
+	runner.Install = func(context.Context, config.Config, string, io.Writer) error { return nil }
+
+	if err := runner.Run(context.Background(), config.Config{}); !errors.Is(err, wantErr) {
+		t.Fatalf("Run() error = %v, want %v", err, wantErr)
+	}
+	if len(logger.records) != 1 || logger.records[0].Result != "shutdown-failed" {
+		t.Fatalf("shutdown failure record = %#v, want shutdown-failed", logger.records)
+	}
+}
+
+func TestRunnerRedactsTokenFromReturnedErrorAndLog(t *testing.T) {
+	token := "secret-token-from-config"
+	wantErr := errors.New("release request failed: api_token=" + token)
+	logger := &fakeLogger{}
+	runner := newTestRunner(t, "v1.2.2", Release{}, &fakeScanner{})
+	runner.Releases = fakeReleaseClient{err: wantErr}
+	runner.Logger = logger
+
+	err := runner.Run(context.Background(), config.Config{Token: token})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run() error = %v, want wrapped release error", err)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("returned error leaked token: %q", err)
+	}
+	if len(logger.records) != 1 || strings.Contains(logger.records[0].Error, token) {
+		t.Fatalf("logged record leaked token: %#v", logger.records)
+	}
+}
+
+func TestRunnerReloadsConfigAfterAcquiringUpdateLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := config.Config{URL: "https://old.example", Token: "old-token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "old-agent"}
+	fresh := config.Config{URL: "https://new.example", Token: "new-token", ASN: 64512, Limit: 250, CurlWorkers: 40, MasscanCPUPercent: 45, AgentID: "new-agent"}
+	if err := config.Save(path, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := &fakeScanner{}
+	runner := newTestRunner(t, "v1.2.2", Release{Version: "v1.2.3"}, scanner)
+	runner.ConfigPath = path
+	runner.Install = func(_ context.Context, cfg config.Config, version string, _ io.Writer) error {
+		if cfg != fresh {
+			t.Fatalf("installer received config %#v, want fresh %#v", cfg, fresh)
+		}
+		if version != "v1.2.3" {
+			t.Fatalf("installer version = %q, want v1.2.3", version)
+		}
+		return nil
+	}
+
+	if err := config.Save(path, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Run(context.Background(), initial); err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 }
 
@@ -203,11 +285,13 @@ func (fake fakeReleaseClient) Latest(context.Context, string) (Release, error) {
 }
 
 type fakeScanner struct {
-	mu        sync.Mutex
-	running   bool
-	events    []string
-	waitErr   error
-	statusErr error
+	mu          sync.Mutex
+	running     bool
+	events      []string
+	waitErr     error
+	statusErr   error
+	waitBlocks  bool
+	waitStarted chan struct{}
 }
 
 func (fake *fakeScanner) Status() (bool, error) {
@@ -225,11 +309,21 @@ func (fake *fakeScanner) Stop() error {
 	return nil
 }
 
-func (fake *fakeScanner) WaitStopped(context.Context, time.Duration) error {
+func (fake *fakeScanner) WaitStopped(ctx context.Context, _ time.Duration) error {
 	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	fake.events = append(fake.events, "wait")
-	return fake.waitErr
+	waitBlocks := fake.waitBlocks
+	waitErr := fake.waitErr
+	waitStarted := fake.waitStarted
+	fake.mu.Unlock()
+	if waitBlocks {
+		if waitStarted != nil {
+			close(waitStarted)
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return waitErr
 }
 
 func (fake *fakeScanner) Start() error {

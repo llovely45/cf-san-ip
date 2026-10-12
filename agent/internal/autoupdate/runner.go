@@ -37,8 +37,12 @@ type Logger interface {
 
 // Runner checks for a newer release and coordinates a safe scanner update.
 type Runner struct {
-	CurrentVersion  string
-	Repository      string
+	CurrentVersion string
+	Repository     string
+	// ConfigPath makes Run reload the configuration while it owns the update
+	// lock. The caller-supplied cfg remains useful for tests and for callers
+	// that already hold a fresh in-memory configuration.
+	ConfigPath      string
 	Releases        ReleaseClient
 	Scanner         Scanner
 	Install         InstallerFunc
@@ -58,6 +62,16 @@ func (r Runner) Run(ctx context.Context, cfg config.Config) error {
 		lockPath = DefaultUpdateLockPath
 	}
 	return WithUpdateLock(lockPath, func() error {
+		if r.ConfigPath != "" {
+			freshConfig, err := config.Load(r.ConfigPath)
+			if err != nil {
+				return r.finish(UpdateRecord{
+					CurrentVersion: r.CurrentVersion,
+					Result:         "config-failed",
+				}, cfg.Token, err)
+			}
+			cfg = freshConfig
+		}
 		return r.checkAndUpdate(ctx, cfg)
 	})
 }
@@ -121,9 +135,10 @@ func (r Runner) checkAndUpdate(ctx context.Context, cfg config.Config) error {
 		}, cfg.Token, err)
 	}
 	baseRecord := UpdateRecord{
-		CurrentVersion: r.CurrentVersion,
-		LatestVersion:  release.Version,
-		WasRunning:     wasRunning,
+		CurrentVersion:  r.CurrentVersion,
+		LatestVersion:   release.Version,
+		WasRunning:      wasRunning,
+		WasRunningKnown: true,
 	}
 	if !wasRunning {
 		if err := r.install(ctx, cfg, release.Version); err != nil {
@@ -139,7 +154,11 @@ func (r Runner) checkAndUpdate(ctx context.Context, cfg config.Config) error {
 	waitErr := r.Scanner.WaitStopped(shutdownContext, r.pollInterval())
 	cancel()
 	if waitErr != nil {
-		return r.finishWithRecord(baseRecord, "shutdown-timeout", cfg.Token, waitErr)
+		result := "shutdown-failed"
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			result = "shutdown-timeout"
+		}
+		return r.finishWithRecord(baseRecord, result, cfg.Token, waitErr)
 	}
 
 	if err := r.install(ctx, cfg, release.Version); err != nil {
@@ -200,16 +219,43 @@ func (r Runner) finish(record UpdateRecord, token string, err error) error {
 
 func (r Runner) finishWithRecord(record UpdateRecord, result, token string, err error) error {
 	record.Result = result
+	var safeErr error
 	if err != nil {
-		record.Error = sanitizeErrorTextWithToken(err.Error(), token)
+		safeErr = redactError(err, token)
+		record.Error = safeErr.Error()
 	}
 	if r.Logger != nil {
 		if logErr := r.Logger.Record(record); logErr != nil {
-			if err == nil {
-				return fmt.Errorf("record automatic update result: %w", logErr)
+			safeLogErr := redactError(logErr, token)
+			if safeErr == nil {
+				return fmt.Errorf("record automatic update result: %s", safeLogErr)
 			}
-			return fmt.Errorf("%w; record automatic update result: %v", err, logErr)
+			return fmt.Errorf("%w; record automatic update result: %s", safeErr, safeLogErr)
 		}
 	}
-	return err
+	return safeErr
+}
+
+type redactedError struct {
+	cause   error
+	message string
+}
+
+func (err redactedError) Error() string {
+	return err.message
+}
+
+func (err redactedError) Unwrap() error {
+	return err.cause
+}
+
+func redactError(err error, token string) error {
+	if err == nil {
+		return nil
+	}
+	message := sanitizeErrorTextWithToken(err.Error(), token)
+	if message == err.Error() {
+		return err
+	}
+	return redactedError{cause: err, message: message}
 }

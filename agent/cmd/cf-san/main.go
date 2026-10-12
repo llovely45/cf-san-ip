@@ -25,6 +25,8 @@ type cliOptions struct {
 	overrides  config.Overrides
 }
 
+var updateLockPath = autoupdate.DefaultUpdateLockPath
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "cf-san:", err)
@@ -54,24 +56,18 @@ func run(arguments []string) error {
 	if options.configPath == "" {
 		options.configPath = menu.DefaultConfigPath()
 	}
-	cfg, loadErr := config.Load(options.configPath)
-	if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
-		return loadErr
-	}
-	if errors.Is(loadErr, os.ErrNotExist) {
-		cfg = config.Defaults()
-	}
-	cfg = config.MergeOverrides(cfg, options.overrides)
-
 	switch command {
 	case "menu":
 		if os.Geteuid() != 0 {
 			return errors.New("请使用 sudo cf-san 打开菜单；配置文件与 Masscan 扫描需要 root 权限")
 		}
-		if config.Validate(cfg) == nil {
-			if err := config.Save(options.configPath, cfg); err != nil {
-				return err
+		if _, err := withConfigUpdate(options.configPath, options.overrides, func(cfg *config.Config) error {
+			if config.Validate(*cfg) != nil {
+				return nil
 			}
+			return config.Save(options.configPath, *cfg)
+		}); err != nil {
+			return err
 		}
 		app := menu.NewApp()
 		app.ConfigPath = options.configPath
@@ -80,26 +76,25 @@ func run(arguments []string) error {
 		app.Manager = &manager
 		return app.Run()
 	case "configure":
-		if err := config.Validate(cfg); err != nil {
-			return err
-		}
-		if err := config.Save(options.configPath, cfg); err != nil {
+		if _, err := withConfigUpdate(options.configPath, options.overrides, func(cfg *config.Config) error {
+			return config.Save(options.configPath, *cfg)
+		}); err != nil {
 			return err
 		}
 		fmt.Fprintln(os.Stdout, "配置已写入本机文件；文件权限为 0600，凭据仍以明文保存。")
 		return nil
 	case "run":
-		if err := config.Save(options.configPath, cfg); err != nil {
+		cfg, err := withConfigUpdateWait(options.configPath, options.overrides, func(cfg *config.Config) error {
+			return config.Save(options.configPath, *cfg)
+		})
+		if err != nil {
 			return err
 		}
 		return runScan(cfg, options.configPath)
 	case "auto-update":
-		if err := config.Validate(cfg); err != nil {
-			return err
-		}
 		manager := menu.NewManager()
 		manager.Arguments = []string{"run", "--config", options.configPath}
-		return runAutomaticUpdate(cfg, options.configPath, manager)
+		return runAutomaticUpdate(config.Config{}, options.configPath, manager)
 	default:
 		return fmt.Errorf("未知命令 %q；可用命令：menu、configure、run、version、auto-update", command)
 	}
@@ -123,15 +118,58 @@ func runAutomaticUpdate(cfg config.Config, configPath string, scanner autoupdate
 	runner := autoupdate.Runner{
 		CurrentVersion: buildinfo.Version,
 		Repository:     buildinfo.Repository,
+		ConfigPath:     configPath,
 		Releases:       autoupdate.NewGitHubClient(),
 		Scanner:        scanner,
 		Install: func(ctx context.Context, installCfg config.Config, version string, output io.Writer) error {
 			return autoupdate.InstallFromWorker(ctx, installCfg, version, output)
 		},
 		Logger:   logger,
-		LockPath: autoupdate.DefaultUpdateLockPath,
+		LockPath: updateLockPath,
 	}
 	return runner.Run(context.Background(), cfg)
+}
+
+func withConfigUpdate(path string, overrides config.Overrides, update func(*config.Config) error) (config.Config, error) {
+	return withConfigUpdateMode(path, overrides, update, false)
+}
+
+func withConfigUpdateWait(path string, overrides config.Overrides, update func(*config.Config) error) (config.Config, error) {
+	return withConfigUpdateMode(path, overrides, update, true)
+}
+
+func withConfigUpdateMode(path string, overrides config.Overrides, update func(*config.Config) error, wait bool) (config.Config, error) {
+	var cfg config.Config
+	lock := autoupdate.WithUpdateLock
+	if wait {
+		lock = autoupdate.WithUpdateLockWait
+	}
+	err := lock(updateLockPath, func() error {
+		fresh, err := loadConfigOrDefaults(path)
+		if err != nil {
+			return err
+		}
+		fresh = config.MergeOverrides(fresh, overrides)
+		if update != nil {
+			if err := update(&fresh); err != nil {
+				return err
+			}
+		}
+		cfg = fresh
+		return nil
+	})
+	return cfg, err
+}
+
+func loadConfigOrDefaults(path string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return config.Defaults(), nil
+	}
+	return config.Config{}, err
 }
 
 func parseOptions(arguments []string) (cliOptions, error) {

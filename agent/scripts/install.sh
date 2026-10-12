@@ -228,9 +228,9 @@ rm -f /usr/local/bin/zgrab2 \
   /usr/local/share/cf-san/zgrab2-blocklist.conf \
   /usr/local/share/cf-san-THIRD_PARTY_NOTICES.txt
 
-/usr/local/bin/cf-san configure --url "$BACKEND_URL" --token "$API_TOKEN"
 if [ "$UPDATE_ONLY" -eq 1 ]; then
   printf 'cf-san updated. Masscan is installed; ZMap and ZGrab2 are no longer used. Exit and restart `cf-san` to use the new version.\n'
 else
+  /usr/local/bin/cf-san configure --url "$BACKEND_URL" --token "$API_TOKEN"
   printf 'cf-san installed. Run `cf-san` to initialize settings and open the text menu.\n'
 fi

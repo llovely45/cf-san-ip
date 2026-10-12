@@ -175,10 +175,17 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   if grep -q 'zmap' "$PACKAGE_LOG"; then echo 'installer still installs ZMap' >&2; exit 1; fi
 
   /usr/local/bin/cf-san configure --url 'https://worker.example' --token 'old-token' --asn 16509 --limit 250 --workers 40
+  DEFAULT_CONFIG_BEFORE="$TEMP_DIR/default-config-${release_arch}.json"
+  cp /etc/cf-san/config.json "$DEFAULT_CONFIG_BEFORE"
+  CUSTOM_CONFIG_PATH="$TEMP_DIR/custom-${release_arch}/config.json"
+  CF_SAN_CONFIG_PATH="$CUSTOM_CONFIG_PATH" /usr/local/bin/cf-san configure \
+    --url 'https://custom.example' --token 'custom-token' --asn 64512 --limit 175 --workers 24
+  CUSTOM_CONFIG_BEFORE="$TEMP_DIR/custom-config-${release_arch}.json"
+  cp "$CUSTOM_CONFIG_PATH" "$CUSTOM_CONFIG_BEFORE"
   : > "$PACKAGE_LOG"
   rm -f "$STUB_DIR/masscan" "$STUB_DIR/cpulimit"
   update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
-    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+    CF_SAN_CONFIG_PATH="$CUSTOM_CONFIG_PATH" CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
       printf '%s\n' "$update_output" >&2
       exit 1
     }
@@ -196,25 +203,23 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
       grep -q '^apk add --no-cache masscan cpulimit libpcap-dev$' "$PACKAGE_LOG"
       ;;
   esac
-  grep -q '"url": "https://updated.example"' /etc/cf-san/config.json || { echo 'update did not save the new backend URL' >&2; exit 1; }
-  grep -q '"token": "updated-token"' /etc/cf-san/config.json || { echo 'update did not save the new API token' >&2; exit 1; }
-  grep -q '"asn": 16509' /etc/cf-san/config.json || { echo 'update did not preserve ASN' >&2; exit 1; }
-  grep -q '"limit": 250' /etc/cf-san/config.json || { echo 'update did not preserve Masscan rate' >&2; exit 1; }
-  grep -q '"curlWorkers": 40' /etc/cf-san/config.json || { echo 'update did not preserve curl validation concurrency' >&2; exit 1; }
+  cmp -s "$DEFAULT_CONFIG_BEFORE" /etc/cf-san/config.json || { echo 'update-only changed the default config' >&2; exit 1; }
+  cmp -s "$CUSTOM_CONFIG_BEFORE" "$CUSTOM_CONFIG_PATH" || { echo 'update-only changed the custom config' >&2; exit 1; }
 
-  # Upgrading from the ZMap/ZGrab2 agent may encounter a legacy sender count
-  # above the new curl worker ceiling. The replacement binary must migrate and
-  # persist a usable capped value instead of failing configuration.
-  printf '%s\n' '{"url":"https://updated.example","token":"updated-token","asn":16509,"limit":250,"senders":8192,"agentId":"legacy-agent"}' > /etc/cf-san/config.json
+  # Update-only must leave legacy config migration to the replacement agent; it
+  # must not invoke configure and overwrite the file with installer defaults.
+  LEGACY_CONFIG_PATH="$TEMP_DIR/legacy-${release_arch}/config.json"
+  mkdir -p "$(dirname "$LEGACY_CONFIG_PATH")"
+  printf '%s\n' '{"url":"https://legacy.example","token":"legacy-token","asn":16509,"limit":250,"senders":8192,"agentId":"legacy-agent"}' > "$LEGACY_CONFIG_PATH"
+  LEGACY_CONFIG_BEFORE="$TEMP_DIR/legacy-config-${release_arch}.json"
+  cp "$LEGACY_CONFIG_PATH" "$LEGACY_CONFIG_BEFORE"
   legacy_update_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
-    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+    CF_SAN_CONFIG_PATH="$LEGACY_CONFIG_PATH" CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
       printf '%s\n' "$legacy_update_output" >&2
       exit 1
     }
   case "$legacy_update_output" in *'curl worker count cannot exceed'*) echo 'update rejected an over-limit legacy sender count' >&2; exit 1 ;; esac
-  grep -q '"curlWorkers": 4096' /etc/cf-san/config.json || { echo 'update did not cap legacy sender count at 4096' >&2; exit 1; }
-  if grep -q '"senders"' /etc/cf-san/config.json; then echo 'update did not migrate the legacy senders key' >&2; exit 1; fi
-  grep -q '"agentId": "legacy-agent"' /etc/cf-san/config.json || { echo 'update did not preserve the legacy Agent ID' >&2; exit 1; }
+  cmp -s "$LEGACY_CONFIG_BEFORE" "$LEGACY_CONFIG_PATH" || { echo 'update-only changed the legacy config' >&2; exit 1; }
 
   # Existing Masscan installations may still be missing libpcap on Debian
   # Bookworm. Updating cf-san must repair that dependency even when the binary

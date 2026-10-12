@@ -21,12 +21,13 @@ const (
 
 // UpdateRecord is one sanitized automatic-update outcome.
 type UpdateRecord struct {
-	Timestamp      time.Time
-	CurrentVersion string
-	LatestVersion  string
-	WasRunning     bool
-	Result         string
-	Error          string
+	Timestamp       time.Time
+	CurrentVersion  string
+	LatestVersion   string
+	WasRunning      bool
+	WasRunningKnown bool
+	Result          string
+	Error           string
 }
 
 // UpdateLogger appends bounded, root-only update diagnostics.
@@ -34,6 +35,8 @@ type UpdateLogger struct {
 	path string
 	mu   sync.Mutex
 }
+
+var chmodRotatedUpdateLog = os.Chmod
 
 // OpenLogger creates or opens a private update log at path.
 func OpenLogger(path string) (*UpdateLogger, error) {
@@ -124,7 +127,15 @@ func (logger *UpdateLogger) rotateIfNeeded(incoming int64) error {
 		return fmt.Errorf("cannot rotate update log: %w", err)
 	}
 	for index := 1; index <= updateLogBackups; index++ {
-		_ = os.Chmod(logger.path+"."+strconv.Itoa(index), 0o600)
+		backup := logger.path + "." + strconv.Itoa(index)
+		if _, err := os.Stat(backup); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return fmt.Errorf("cannot inspect rotated update log: %w", err)
+		}
+		if err := chmodRotatedUpdateLog(backup, 0o600); err != nil {
+			return fmt.Errorf("cannot protect rotated update log: %w", err)
+		}
 	}
 	return nil
 }
@@ -134,12 +145,16 @@ func formatUpdateRecord(record UpdateRecord) string {
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
+	wasRunning := "unknown"
+	if record.WasRunningKnown || record.WasRunning {
+		wasRunning = strconv.FormatBool(record.WasRunning)
+	}
 	line := fmt.Sprintf(
-		"%s current=%s latest=%s was_running=%t result=%s",
+		"%s current=%s latest=%s was_running=%s result=%s",
 		timestamp.Format(time.RFC3339),
 		sanitizeLogField(record.CurrentVersion),
 		sanitizeLogField(record.LatestVersion),
-		record.WasRunning,
+		wasRunning,
 		sanitizeLogField(record.Result),
 	)
 	if record.Error != "" {

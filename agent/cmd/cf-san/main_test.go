@@ -3,11 +3,21 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
 	"cf-san/internal/config"
 )
+
+func useTestUpdateLockPath(t *testing.T) string {
+	t.Helper()
+	previous := updateLockPath
+	path := filepath.Join(t.TempDir(), "update.lock")
+	updateLockPath = path
+	t.Cleanup(func() { updateLockPath = previous })
+	return path
+}
 
 func TestRequireRoot(t *testing.T) {
 	if err := requireRoot(1000); err == nil {
@@ -69,6 +79,7 @@ func TestParseOptionsRejectsInvalidMasscanCPUPercent(t *testing.T) {
 }
 
 func TestConfigureCreatesMissingProtectedConfig(t *testing.T) {
+	useTestUpdateLockPath(t)
 	path := t.TempDir() + "/nested/config.json"
 	err := run([]string{
 		"configure",
@@ -85,5 +96,28 @@ func TestConfigureCreatesMissingProtectedConfig(t *testing.T) {
 	}
 	if cfg.Token != "local-test-token" || cfg.URL != "https://worker.example" {
 		t.Fatalf("saved config = %#v", cfg)
+	}
+}
+
+func TestConfigureReloadsFreshConfigBeforeApplyingOverride(t *testing.T) {
+	useTestUpdateLockPath(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	initial := config.Config{URL: "https://old.example", Token: "old-token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "old-agent"}
+	fresh := config.Config{URL: "https://new.example", Token: "new-token", ASN: 64512, Limit: 250, CurlWorkers: 40, MasscanCPUPercent: 45, AgentID: "new-agent"}
+	if err := config.Save(path, initial); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(path, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"configure", "--config", path, "--token", "configured-token"}); err != nil {
+		t.Fatalf("run(configure) error = %v", err)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != fresh.URL || got.Token != "configured-token" || got.ASN != fresh.ASN || got.Limit != fresh.Limit || got.CurlWorkers != fresh.CurlWorkers || got.MasscanCPUPercent != fresh.MasscanCPUPercent || got.AgentID != fresh.AgentID {
+		t.Fatalf("saved config = %#v, want fresh values with only token changed", got)
 	}
 }

@@ -1,6 +1,7 @@
 package autoupdate
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,5 +86,35 @@ func TestUpdateLoggerRotatesAtOneMiBAndKeepsThreeBackups(t *testing.T) {
 	}
 	if len(current) >= maxUpdateLogBytes {
 		t.Fatalf("current log size = %d, want less than 1 MiB after rotation", len(current))
+	}
+}
+
+func TestUpdateLoggerPropagatesRotatedBackupChmodFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "update.log")
+	logger, err := OpenLogger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxUpdateLogBytes)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("chmod failed")
+	previousChmod := chmodRotatedUpdateLog
+	chmodRotatedUpdateLog = func(string, os.FileMode) error { return wantErr }
+	t.Cleanup(func() { chmodRotatedUpdateLog = previousChmod })
+
+	if err := logger.Record(UpdateRecord{CurrentVersion: "v1.2.2", LatestVersion: "v1.2.3", Result: "attempt"}); !errors.Is(err, wantErr) {
+		t.Fatalf("Record() error = %v, want propagated chmod failure", err)
+	}
+}
+
+func TestFormatUpdateRecordLeavesUnknownScanStateUnknown(t *testing.T) {
+	line := formatUpdateRecord(UpdateRecord{CurrentVersion: "v1.2.2", LatestVersion: "v1.2.3", Result: "current"})
+	if !strings.Contains(line, "was_running=unknown") {
+		t.Fatalf("formatted record = %q, want unknown scan state", line)
+	}
+	if strings.Contains(line, "was_running=false") {
+		t.Fatalf("formatted record falsely claims stopped scan: %q", line)
 	}
 }

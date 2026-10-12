@@ -106,7 +106,9 @@ func (app *App) Run() error {
 				fmt.Fprintln(app.Output, "扫描已在后台启动。")
 			}
 		case "3":
-			if err := app.manager().Stop(); err != nil {
+			if err := autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+				return app.manager().Stop()
+			}); err != nil {
 				fmt.Fprintf(app.Output, "暂停失败：%v\n", err)
 			} else {
 				fmt.Fprintln(app.Output, "已发送安全暂停信号；当前块会在下次运行时重扫。")
@@ -160,60 +162,71 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 	if os.Geteuid() != 0 {
 		return errors.New("请使用 sudo cf-san；本机配置文件需要由 root 安全保存")
 	}
-	if strings.TrimSpace(cfg.URL) == "" {
-		value, err := readLine(reader, app.Output, "Worker HTTPS URL：")
+	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+		fresh, err := loadConfig(app.ConfigPath)
 		if err != nil {
 			return err
 		}
-		cfg.URL = strings.TrimRight(value, "/")
-	}
-	if cfg.Token == "" {
-		value, err := readLine(reader, app.Output, "API Token（明文输入，仅写入本机 0600 配置文件）：")
+		if strings.TrimSpace(fresh.URL) == "" {
+			value, err := readLine(reader, app.Output, "Worker HTTPS URL：")
+			if err != nil {
+				return err
+			}
+			fresh.URL = strings.TrimRight(value, "/")
+		}
+		if fresh.Token == "" {
+			value, err := readLine(reader, app.Output, "API Token（明文输入，仅写入本机 0600 配置文件）：")
+			if err != nil {
+				return err
+			}
+			fresh.Token = value
+		}
+		if fresh.ASN == 0 {
+			value, err := readLine(reader, app.Output, "ASN：")
+			if err != nil {
+				return err
+			}
+			if err := UpdateSetting(&fresh, "asn", value); err != nil {
+				return err
+			}
+		}
+		if err := config.ValidateForScan(fresh); err != nil {
+			return err
+		}
+		if _, err := exec.LookPath("masscan"); err != nil {
+			return errors.New("未找到 masscan；请运行 cf-san 安装脚本")
+		}
+		if _, err := exec.LookPath("curl"); err != nil {
+			return errors.New("未找到 curl；请运行 cf-san 安装脚本")
+		}
+		if _, err := exec.LookPath("cpulimit"); err != nil {
+			return errors.New("未找到 cpulimit；请运行 cf-san 安装脚本以启用 Masscan CPU 上限")
+		}
+		if err := config.Save(app.ConfigPath, fresh); err != nil {
+			return err
+		}
+		*cfg = fresh
+		client, err := backend.NewClient(fresh.URL, fresh.Token, fresh.AgentID)
 		if err != nil {
 			return err
 		}
-		cfg.Token = value
-	}
-	if cfg.ASN == 0 {
-		value, err := readLine(reader, app.Output, "ASN：")
+		plan, err := client.Plan(context.Background(), fresh.ASN)
 		if err != nil {
 			return err
 		}
-		if err := UpdateSetting(cfg, "asn", value); err != nil {
-			return err
-		}
-	}
-	if err := config.ValidateForScan(*cfg); err != nil {
-		return err
-	}
-	if _, err := exec.LookPath("masscan"); err != nil {
-		return errors.New("未找到 masscan；请运行 cf-san 安装脚本")
-	}
-	if _, err := exec.LookPath("curl"); err != nil {
-		return errors.New("未找到 curl；请运行 cf-san 安装脚本")
-	}
-	if _, err := exec.LookPath("cpulimit"); err != nil {
-		return errors.New("未找到 cpulimit；请运行 cf-san 安装脚本以启用 Masscan CPU 上限")
-	}
-	if err := config.Save(app.ConfigPath, *cfg); err != nil {
-		return err
-	}
-	client, err := backend.NewClient(cfg.URL, cfg.Token, cfg.AgentID)
-	if err != nil {
-		return err
-	}
-	plan, err := client.Plan(context.Background(), cfg.ASN)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(app.Output, "后端连接正常；当前 ASN %d 有 %d 个来源前缀，扫描断点已载入。\n", cfg.ASN, plan.PrefixCount())
-	return nil
+		fmt.Fprintf(app.Output, "后端连接正常；当前 ASN %d 有 %d 个来源前缀，扫描断点已载入。\n", fresh.ASN, plan.PrefixCount())
+		return nil
+	})
 }
 
 func (app *App) start(cfg *config.Config) error {
 	manager := app.manager()
 	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
-		if err := config.ValidateForScan(*cfg); err != nil {
+		fresh, err := loadConfig(app.ConfigPath)
+		if err != nil {
+			return err
+		}
+		if err := config.ValidateForScan(fresh); err != nil {
 			return err
 		}
 		if _, err := exec.LookPath("masscan"); err != nil {
@@ -225,9 +238,10 @@ func (app *App) start(cfg *config.Config) error {
 		if _, err := exec.LookPath("cpulimit"); err != nil {
 			return errors.New("未找到 cpulimit；请先选择菜单 1 初始化环境")
 		}
-		if err := config.Save(app.ConfigPath, *cfg); err != nil {
+		if err := config.Save(app.ConfigPath, fresh); err != nil {
 			return err
 		}
+		*cfg = fresh
 		return manager.Start()
 	})
 }
@@ -238,6 +252,10 @@ func (app *App) updateLatest(cfg *config.Config) error {
 		updater = updateLatestFromWorker
 	}
 	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+		fresh, err := loadConfig(app.ConfigPath)
+		if err != nil {
+			return err
+		}
 		running, err := app.manager().Status()
 		if err != nil {
 			return err
@@ -245,13 +263,14 @@ func (app *App) updateLatest(cfg *config.Config) error {
 		if running {
 			return errors.New("请先暂停扫描，再执行更新")
 		}
-		if err := config.Validate(*cfg); err != nil {
+		if err := config.Validate(fresh); err != nil {
 			return err
 		}
-		if err := config.Save(app.ConfigPath, *cfg); err != nil {
+		if err := config.Save(app.ConfigPath, fresh); err != nil {
 			return err
 		}
-		return updater(context.Background(), *cfg, app.Output)
+		*cfg = fresh
+		return updater(context.Background(), fresh, app.Output)
 	})
 }
 
@@ -275,14 +294,21 @@ func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice s
 	if err != nil {
 		return err
 	}
-	if err := UpdateSetting(cfg, key, value); err != nil {
-		return err
-	}
-	if err := config.Save(app.ConfigPath, *cfg); err != nil {
-		return err
-	}
-	fmt.Fprintln(app.Output, "设置已保存。")
-	return nil
+	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+		fresh, err := loadConfig(app.ConfigPath)
+		if err != nil {
+			return err
+		}
+		if err := UpdateSetting(&fresh, key, value); err != nil {
+			return err
+		}
+		if err := config.Save(app.ConfigPath, fresh); err != nil {
+			return err
+		}
+		*cfg = fresh
+		fmt.Fprintln(app.Output, "设置已保存。")
+		return nil
+	})
 }
 
 func (app *App) printStatus(cfg config.Config) {

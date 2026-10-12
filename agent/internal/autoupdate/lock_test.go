@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWithUpdateLockCreatesPrivateParentAndLockFile(t *testing.T) {
@@ -55,6 +56,42 @@ func TestWithUpdateLockRejectsOverlappingUpdater(t *testing.T) {
 	}
 	if !errors.Is(secondErr, ErrUpdateInProgress) {
 		t.Fatalf("second updater error = %v, want ErrUpdateInProgress", secondErr)
+	}
+}
+
+func TestWithUpdateLockWaitAcquiresAfterExistingHolderReleases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "update.lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- WithUpdateLock(path, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	callback := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- WithUpdateLockWait(path, func() error {
+			close(callback)
+			return nil
+		})
+	}()
+	select {
+	case <-callback:
+		t.Fatal("blocking lock callback ran while the first holder was active")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first lock holder error = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("blocking lock waiter error = %v", err)
 	}
 }
 
