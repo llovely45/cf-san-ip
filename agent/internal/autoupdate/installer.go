@@ -73,6 +73,7 @@ func loadInstallerScript(ctx context.Context, client *http.Client, backendURL st
 	if client == nil {
 		client = &http.Client{Timeout: workerRequestTimeout}
 	}
+	client = clientWithSafeRedirects(client, base.Host)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("cannot download Worker installer script: %w", err)
@@ -92,6 +93,24 @@ func loadInstallerScript(ctx context.Context, client *http.Client, backendURL st
 		return nil, errors.New("Worker installer is outdated or invalid; update the Worker first")
 	}
 	return data, nil
+}
+
+func clientWithSafeRedirects(client *http.Client, allowedHost string) *http.Client {
+	safeClient := *client
+	previousCheckRedirect := safeClient.CheckRedirect
+	safeClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if request.URL.Scheme != "https" {
+			return errors.New("refusing Worker installer redirect to non-HTTPS URL")
+		}
+		if request.URL.Host != allowedHost {
+			return errors.New("refusing Worker installer redirect to different host")
+		}
+		if previousCheckRedirect != nil {
+			return previousCheckRedirect(request, via)
+		}
+		return nil
+	}
+	return &safeClient
 }
 
 func runInstallerScript(ctx context.Context, script []byte, cfg config.Config, version string, output io.Writer, shell string) error {

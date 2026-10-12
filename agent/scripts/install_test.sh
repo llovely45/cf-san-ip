@@ -46,6 +46,13 @@ for version in latest v1.2.3-rc.1 v1.02.3 v1.2 v1.2.3+build; do
     --url https://worker.example --token 'token-must-not-leak' --update-only --version "$version"
 done
 
+embedded_newline_version=$(printf 'v1.2.3\ninvalid')
+expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
+  --url https://worker.example --token 'token-must-not-leak' --update-only --version "$embedded_newline_version"
+embedded_control_version=$(printf 'v1.2.3\tinvalid')
+expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
+  --url https://worker.example --token 'token-must-not-leak' --update-only --version "$embedded_control_version"
+
 # Keep the URL selection and checksum download paths visible in this focused
 # preflight test; the mocked integration test exercises the real downloads.
 grep -Fq 'releases/latest/download' "$INSTALLER" || fail 'installer lost latest-release URL'

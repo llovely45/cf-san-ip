@@ -39,6 +39,53 @@ func TestLoadInstallerScriptRejectsNonHTTPSWorker(t *testing.T) {
 	}
 }
 
+func TestLoadInstallerScriptRejectsHTTPSDowngradeRedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("HTTP downgrade target was contacted")
+		_, _ = io.WriteString(w, validInstallerFixture)
+	}))
+	defer target.Close()
+
+	worker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer worker.Close()
+
+	_, err := loadInstallerScript(context.Background(), worker.Client(), worker.URL)
+	if err == nil || !strings.Contains(err.Error(), "non-HTTPS") {
+		t.Fatalf("loadInstallerScript error = %v, want an HTTPS downgrade rejection", err)
+	}
+}
+
+func TestLoadInstallerScriptRejectsCrossHostRedirect(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("cross-host redirect target was contacted")
+		_, _ = io.WriteString(w, validInstallerFixture)
+	}))
+	defer target.Close()
+
+	worker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer worker.Close()
+
+	client := worker.Client()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("worker client transport = %T, want *http.Transport", client.Transport)
+	}
+	transport = transport.Clone()
+	transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	transport.TLSClientConfig.RootCAs = transport.TLSClientConfig.RootCAs.Clone()
+	transport.TLSClientConfig.RootCAs.AddCert(target.Certificate())
+	client.Transport = transport
+
+	_, err := loadInstallerScript(context.Background(), client, worker.URL)
+	if err == nil || !strings.Contains(err.Error(), "different host") {
+		t.Fatalf("loadInstallerScript error = %v, want a cross-host redirect rejection", err)
+	}
+}
+
 func TestLoadInstallerScriptRejectsMalformedWorkerResponses(t *testing.T) {
 	tests := []struct {
 		name string

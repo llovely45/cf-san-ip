@@ -16,6 +16,29 @@ usage() {
   printf 'Usage: install.sh --url https://worker.example --token TOKEN [--update-only [--version vMAJOR.MINOR.PATCH]]\n' >&2
 }
 
+is_stable_version() {
+  stable_version=$1
+  case "$stable_version" in
+    *[!0-9.v]*) return 1 ;;
+    v*) ;;
+    *) return 1 ;;
+  esac
+
+  stable_version=${stable_version#v}
+  stable_ifs=$IFS
+  IFS=.
+  set -- $stable_version
+  IFS=$stable_ifs
+  [ "$#" -eq 3 ] || return 1
+
+  for stable_component in "$@"; do
+    case "$stable_component" in
+      0|[1-9]*) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --url)
@@ -51,7 +74,7 @@ done
 
 if [ -n "$UPDATE_VERSION" ]; then
   [ "$UPDATE_ONLY" -eq 1 ] || fail '--version requires --update-only'
-  printf '%s\n' "$UPDATE_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || \
+  is_stable_version "$UPDATE_VERSION" || \
     fail 'version must be a stable vMAJOR.MINOR.PATCH tag'
 fi
 
