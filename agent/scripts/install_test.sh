@@ -41,7 +41,7 @@ expect_failure 'missing value for --version' \
 expect_failure 'missing value for --version' \
   --url https://worker.example --token 'token-must-not-leak' --update-only --version ''
 
-for version in latest v1.2.3-rc.1 v1.02.3 v1.2 v1.2.3+build; do
+for version in latest v1.2.3v v1.2.3suffix v1.2.3-rc.1 v1.02.3 v1.2 v1.2.3+build; do
   expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
     --url https://worker.example --token 'token-must-not-leak' --update-only --version "$version"
 done

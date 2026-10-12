@@ -19,24 +19,10 @@ usage() {
 is_stable_version() {
   stable_version=$1
   case "$stable_version" in
-    *[!0-9.v]*) return 1 ;;
-    v*) ;;
-    *) return 1 ;;
+    *[[:cntrl:]]*) return 1 ;;
   esac
-
-  stable_version=${stable_version#v}
-  stable_ifs=$IFS
-  IFS=.
-  set -- $stable_version
-  IFS=$stable_ifs
-  [ "$#" -eq 3 ] || return 1
-
-  for stable_component in "$@"; do
-    case "$stable_component" in
-      0|[1-9]*) ;;
-      *) return 1 ;;
-    esac
-  done
+  printf '%s\n' "$stable_version" |
+    LC_ALL=C grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 }
 
 while [ "$#" -gt 0 ]; do
