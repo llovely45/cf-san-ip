@@ -496,6 +496,24 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   cmp -s "$CHECKSUM_BINARY_BEFORE" /usr/local/bin/cf-san || fail 'checksum mismatch replaced the cf-san binary'
   sha256sum "$archive" > "$checksum"
 
+  # The release fixture can be the real Go binary in CI. Keep the wrapper
+  # test deterministic and independent of GitHub availability by replacing it
+  # temporarily with a command stub that verifies the exact invocation.
+  WRAPPER_CALL_LOG="$TEMP_DIR/wrapper-call-$release_arch.log"
+  export WRAPPER_CALL_LOG
+  cat > "$TEMP_DIR/cf-san-wrapper-stub" <<'STUB'
+#!/bin/sh
+set -eu
+test "$#" -eq 3 || exit 2
+test "$1" = auto-update || exit 2
+test "$2" = --config || exit 2
+test "$3" = /etc/cf-san/config.json || exit 2
+printf '%s\n' "$*" >> "$WRAPPER_CALL_LOG"
+printf '%s\n' 'fixture auto-update'
+STUB
+  chmod 0755 "$TEMP_DIR/cf-san-wrapper-stub"
+  cp "$TEMP_DIR/cf-san-wrapper-stub" /usr/local/bin/cf-san
+
   : > "$SLEEP_LOG"
   : > /var/log/cf-san/update.log
   for expected_delay in 0 1800; do
@@ -504,6 +522,8 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
     test "$(tail -n 1 "$SLEEP_LOG")" = "$expected_delay" || fail "scheduler delay was not $expected_delay seconds"
   done
   grep -q 'fixture auto-update' /var/log/cf-san/update.log || fail 'scheduler wrapper did not invoke cf-san auto-update'
+  test "$(wc -l < "$WRAPPER_CALL_LOG" | tr -d '[:space:]')" = 2 || fail 'scheduler wrapper did not invoke cf-san exactly twice'
+  grep -Fxq 'auto-update --config /etc/cf-san/config.json' "$WRAPPER_CALL_LOG" || fail 'scheduler wrapper passed unexpected arguments to cf-san'
   export MOCK_SLEEP_FAILURE=1
   if /usr/local/libexec/cf-san-auto-update; then
     fail 'scheduler wrapper ignored a sleep failure'
