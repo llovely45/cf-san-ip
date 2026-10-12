@@ -64,6 +64,7 @@ jobs:
             -v "$GITHUB_WORKSPACE/agent/scripts:/repo/scripts:ro" \
             -v "$FIXTURE_DIR:/fixtures:ro" \
             -e CF_SAN_FIXTURE_DIR=/fixtures \
+            -e CF_SAN_MOCKED_TEST_IN_CONTAINER=1 \
             "$CONTAINER_IMAGE" /bin/sh /repo/scripts/install_mocked_test.sh
 
   build:

@@ -400,6 +400,38 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   assert_scheduler_files
   assert_activation
 
+  case "$ID" in
+    debian) scheduler_job=/etc/cron.d/cf-san-auto-update ;;
+    alpine) scheduler_job=/etc/periodic/daily/cf-san-auto-update ;;
+  esac
+  rm -f "$scheduler_job" /usr/local/libexec/cf-san-auto-update
+  : > "$SERVICE_LOG"
+  repaired_scheduler_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
+    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+      printf '%s\n' "$repaired_scheduler_output" >&2
+      exit 1
+    }
+  case "$repaired_scheduler_output" in *updated-token*) fail 'scheduler repair echoed the API token' ;; esac
+  assert_scheduler_files
+  assert_activation
+  test "$(stat -c '%a' /etc/cf-san/config.json)" = 600 || fail 'config permissions changed during scheduler repair'
+  REPAIRED_WRAPPER="$TEMP_DIR/repaired-wrapper-$release_arch"
+  REPAIRED_JOB="$TEMP_DIR/repaired-job-$release_arch"
+  cp /usr/local/libexec/cf-san-auto-update "$REPAIRED_WRAPPER"
+  cp "$scheduler_job" "$REPAIRED_JOB"
+  : > "$SERVICE_LOG"
+  idempotent_scheduler_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
+    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only 2>&1) || {
+      printf '%s\n' "$idempotent_scheduler_output" >&2
+      exit 1
+    }
+  case "$idempotent_scheduler_output" in *updated-token*) fail 'idempotent scheduler repair echoed the API token' ;; esac
+  cmp -s "$REPAIRED_WRAPPER" /usr/local/libexec/cf-san-auto-update || fail 'idempotent update changed the scheduler wrapper'
+  cmp -s "$REPAIRED_JOB" "$scheduler_job" || fail 'idempotent update changed the scheduler job'
+  assert_scheduler_files
+  assert_activation
+  test "$(stat -c '%a' /etc/cf-san/config.json)" = 600 || fail 'config permissions changed during idempotent update'
+
   /usr/local/bin/cf-san configure --url 'https://worker.example' --token 'old-token' --asn 16509 --limit 250 --workers 40
   DEFAULT_CONFIG_BEFORE="$TEMP_DIR/default-config-$release_arch.json"
   cp /etc/cf-san/config.json "$DEFAULT_CONFIG_BEFORE"
@@ -425,6 +457,8 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   assert_activation
   cmp -s "$DEFAULT_CONFIG_BEFORE" /etc/cf-san/config.json || fail 'update-only changed the default config'
   cmp -s "$CUSTOM_CONFIG_BEFORE" "$CUSTOM_CONFIG_PATH" || fail 'update-only changed the custom config'
+  test "$(stat -c '%a' /etc/cf-san/config.json)" = 600 || fail 'update-only changed the default config mode'
+  test "$(stat -c '%a' "$CUSTOM_CONFIG_PATH")" = 600 || fail 'update-only changed the custom config mode'
 
   : > "$CURL_LOG"
   pinned_output=$(CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
@@ -438,6 +472,19 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
   if grep -q '/releases/latest/download' "$CURL_LOG"; then fail 'pinned update used the latest-release URL'; fi
   assert_scheduler_files
   cmp -s "$CUSTOM_CONFIG_BEFORE" "$CUSTOM_CONFIG_PATH" || fail 'pinned update changed the custom config'
+  test "$(stat -c '%a' "$CUSTOM_CONFIG_PATH")" = 600 || fail 'pinned update changed the custom config mode'
+
+  CHECKSUM_BINARY_BEFORE="$TEMP_DIR/checksum-binary-$release_arch"
+  cp /usr/local/bin/cf-san "$CHECKSUM_BINARY_BEFORE"
+  printf '%064d\n' 0 > "$checksum"
+  : > "$CURL_LOG"
+  if CF_SAN_BACKEND_URL='https://updated.example' CF_SAN_API_TOKEN='updated-token' \
+    CF_SAN_RELEASE_REPOSITORY='example/cf-san' sh "$INSTALLER" --update-only >"$TEMP_DIR/checksum-mismatch-$release_arch.out" 2>&1; then
+    fail 'checksum mismatch unexpectedly succeeded'
+  fi
+  grep -q 'release checksum does not match' "$TEMP_DIR/checksum-mismatch-$release_arch.out" || fail 'checksum mismatch failure was not actionable'
+  cmp -s "$CHECKSUM_BINARY_BEFORE" /usr/local/bin/cf-san || fail 'checksum mismatch replaced the cf-san binary'
+  sha256sum "$archive" > "$checksum"
 
   : > "$SLEEP_LOG"
   : > /var/log/cf-san/update.log

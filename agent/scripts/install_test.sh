@@ -4,6 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 INSTALLER="$SCRIPT_DIR/install.sh"
 MOCKED_INSTALLER_TEST="$SCRIPT_DIR/install_mocked_test.sh"
+WORKFLOW="$SCRIPT_DIR/../../.github/workflows/agent-release.yml"
 
 fail() {
   printf 'installer test failed: %s\n' "$1" >&2
@@ -66,6 +67,9 @@ grep -Fq 'systemctl enable --now cron' "$INSTALLER" || fail 'installer lost the 
 grep -Fq 'update-rc.d cron defaults' "$INSTALLER" || fail 'installer lost the Debian non-systemd activation path'
 grep -Fq 'rc-update add crond default' "$INSTALLER" || fail 'installer lost the Alpine OpenRC activation path'
 grep -Fq 'detect_supported_os' "$INSTALLER" || fail 'installer does not validate the supported OS before update-only work'
+[ -f "$WORKFLOW" ] || fail 'agent release workflow is missing'
+grep -Fq -- '-e CF_SAN_MOCKED_TEST_IN_CONTAINER=1' "$WORKFLOW" || fail 'workflow did not mark the mocked test as running in a container'
+grep -Fq '"$CONTAINER_IMAGE" /bin/sh /repo/scripts/install_mocked_test.sh' "$WORKFLOW" || fail 'workflow lost the mocked installer test command'
 
 if printf '%s' "$OUTPUT" | grep -q 'token-must-not-leak'; then
   fail 'installer echoed the API token in an error message'
