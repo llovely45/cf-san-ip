@@ -152,6 +152,8 @@ write_scheduler_files() {
 #!/bin/sh
 set -eu
 
+exec >> /var/log/cf-san/update.log 2>&1
+
 raw=$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')
 case "$raw" in
   ''|*[!0-9]*)
@@ -161,7 +163,7 @@ case "$raw" in
 esac
 delay=$((raw % 1801))
 sleep "$delay"
-exec /usr/local/bin/cf-san auto-update >> /var/log/cf-san/update.log 2>&1
+exec /usr/local/bin/cf-san auto-update
 WRAPPER
   if ! install -m 0750 "$WRAPPER_SOURCE" /usr/local/libexec/cf-san-auto-update; then
     fail 'cannot install the cf-san scheduler wrapper'

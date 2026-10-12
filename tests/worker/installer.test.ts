@@ -19,14 +19,22 @@ describe("worker installer route", () => {
     },
   );
 
-  it("serves a no-store installer configured for the matching GitHub repository", async () => {
-    const routes = createInstallerRoutes("example/cf-san");
-    const response = await routes.request("https://app.test/install");
+  it("serves the configured scheduler and exact pinned-version installer", async () => {
+    const routes = createInstallerRoutes();
+    const response = await routes.request(
+      "https://app.test/install",
+      {},
+      { CF_SAN_RELEASE_REPOSITORY: "llovely45/cf-san-ip" },
+    );
     const script = await response.text();
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toContain("text/x-shellscript");
     expect(response.headers.get("Cache-Control")).toContain("no-store");
-    expect(script).toContain("example/cf-san");
+    expect(script).toContain("DEFAULT_RELEASE_REPOSITORY='llovely45/cf-san-ip'");
+    expect(script).toContain("17 3 * * * root /usr/local/libexec/cf-san-auto-update");
+    expect(script).toContain("/etc/periodic/daily/cf-san-auto-update");
+    expect(script).toContain('BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/download/${UPDATE_VERSION}"');
+    expect(script).toContain("--version vMAJOR.MINOR.PATCH");
     expect(script).toContain("--url");
     expect(script).toContain("--token");
     expect(script).not.toContain("api-token");

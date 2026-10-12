@@ -252,6 +252,7 @@ cat > "$STUB_DIR/sleep" <<'STUB'
 set -eu
 printf '%s\n' "${1:-}" >> "$SLEEP_LOG"
 if [ "${MOCK_SLEEP_FAILURE:-0}" = 1 ]; then
+  printf '%s\n' 'fixture sleep failure' >&2
   exit 1
 fi
 STUB
@@ -494,6 +495,12 @@ for arch_case in 'x86_64 amd64' 'aarch64 arm64'; do
     test "$(tail -n 1 "$SLEEP_LOG")" = "$expected_delay" || fail "scheduler delay was not $expected_delay seconds"
   done
   grep -q 'fixture auto-update' /var/log/cf-san/update.log || fail 'scheduler wrapper did not invoke cf-san auto-update'
+  export MOCK_SLEEP_FAILURE=1
+  if /usr/local/libexec/cf-san-auto-update; then
+    fail 'scheduler wrapper ignored a sleep failure'
+  fi
+  grep -q 'fixture sleep failure' /var/log/cf-san/update.log || fail 'scheduler wrapper did not capture pre-update stderr'
+  export MOCK_SLEEP_FAILURE=0
   assert_no_credentials
 
   # Update-only must leave legacy config migration to the replacement agent;
