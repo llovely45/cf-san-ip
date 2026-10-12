@@ -1,6 +1,6 @@
 # cf-san Daily Automatic Update Design
 
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Approved for implementation
 **Date:** 2026-10-12
 **Repository branch:** `main`
 
