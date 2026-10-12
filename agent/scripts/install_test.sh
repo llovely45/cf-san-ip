@@ -22,13 +22,34 @@ expect_failure() {
   if OUTPUT=$(CF_SAN_RELEASE_REPOSITORY='invalid repo' sh "$INSTALLER" "$@" 2>&1); then
     fail "installer unexpectedly succeeded for: $*"
   fi
-  printf '%s' "$OUTPUT" | grep -Fq "$expected" || fail "expected '$expected' in failure output"
+  printf '%s' "$OUTPUT" | grep -Fq -- "$expected" || fail "expected '$expected' in failure output"
 }
 
 expect_failure 'backend URL is required'
 expect_failure 'backend URL must use HTTPS' --url http://worker.example --token 'token-must-not-leak'
 expect_failure 'API token is required' --url https://worker.example
 expect_failure 'release repository is not configured on the Worker' --url https://worker.example --token 'token-must-not-leak'
+
+# A valid pin is accepted only in update-only mode. The deliberately invalid
+# repository makes the accepted case stop before any package or release work.
+expect_failure 'release repository is not configured on the Worker' \
+  --url https://worker.example --token 'token-must-not-leak' --update-only --version v1.2.3
+expect_failure '--version requires --update-only' \
+  --url https://worker.example --token 'token-must-not-leak' --version v1.2.3
+expect_failure 'missing value for --version' \
+  --url https://worker.example --token 'token-must-not-leak' --update-only --version
+expect_failure 'missing value for --version' \
+  --url https://worker.example --token 'token-must-not-leak' --update-only --version ''
+
+for version in latest v1.2.3-rc.1 v1.02.3 v1.2 v1.2.3+build; do
+  expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
+    --url https://worker.example --token 'token-must-not-leak' --update-only --version "$version"
+done
+
+# Keep the URL selection and checksum download paths visible in this focused
+# preflight test; the mocked integration test exercises the real downloads.
+grep -Fq 'releases/latest/download' "$INSTALLER" || fail 'installer lost latest-release URL'
+grep -Fq 'releases/download/${UPDATE_VERSION}' "$INSTALLER" || fail 'installer lost pinned-release URL'
 
 if printf '%s' "$OUTPUT" | grep -q 'token-must-not-leak'; then
   fail 'installer echoed the API token in an error message'

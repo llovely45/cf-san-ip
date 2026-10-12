@@ -5,6 +5,7 @@ DEFAULT_RELEASE_REPOSITORY='__CF_SAN_RELEASE_REPOSITORY__'
 BACKEND_URL=${CF_SAN_BACKEND_URL:-}
 API_TOKEN=${CF_SAN_API_TOKEN:-}
 UPDATE_ONLY=0
+UPDATE_VERSION=
 
 fail() {
   printf 'cf-san installer: %s\n' "$1" >&2
@@ -12,7 +13,7 @@ fail() {
 }
 
 usage() {
-  printf 'Usage: install.sh --url https://worker.example --token TOKEN [--update-only]\n' >&2
+  printf 'Usage: install.sh --url https://worker.example --token TOKEN [--update-only [--version vMAJOR.MINOR.PATCH]]\n' >&2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -31,6 +32,12 @@ while [ "$#" -gt 0 ]; do
       UPDATE_ONLY=1
       shift
       ;;
+    --version)
+      [ "$#" -ge 2 ] || { usage; fail 'missing value for --version'; }
+      [ -n "$2" ] || { usage; fail 'missing value for --version'; }
+      UPDATE_VERSION=$2
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -41,6 +48,12 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ -n "$UPDATE_VERSION" ]; then
+  [ "$UPDATE_ONLY" -eq 1 ] || fail '--version requires --update-only'
+  printf '%s\n' "$UPDATE_VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || \
+    fail 'version must be a stable vMAJOR.MINOR.PATCH tag'
+fi
 
 [ -n "$BACKEND_URL" ] || { usage; fail 'backend URL is required'; }
 case "$BACKEND_URL" in https://*) ;; *) fail 'backend URL must use HTTPS' ;; esac
@@ -182,7 +195,11 @@ TEMP_DIR=$(mktemp -d)
 cleanup() { rm -rf -- "$TEMP_DIR"; }
 trap cleanup 0
 ARCHIVE="cf-san_linux_${ARCH}.tar.gz"
-BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/latest/download"
+if [ -n "$UPDATE_VERSION" ]; then
+  BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/download/${UPDATE_VERSION}"
+else
+  BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/latest/download"
+fi
 curl --fail --silent --show-error --location --retry 3 "${BASE_URL}/${ARCHIVE}" -o "${TEMP_DIR}/${ARCHIVE}"
 curl --fail --silent --show-error --location --retry 3 "${BASE_URL}/${ARCHIVE}.sha256" -o "${TEMP_DIR}/${ARCHIVE}.sha256"
 EXPECTED_SHA=$(awk 'NR == 1 { print $1 }' "${TEMP_DIR}/${ARCHIVE}.sha256")
