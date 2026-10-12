@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"cf-san/internal/autoupdate"
 	"cf-san/internal/config"
 )
 
@@ -57,9 +59,10 @@ func TestMenuUpdateChoiceRunsUpdaterAndPersistsConfig(t *testing.T) {
 	}
 	var called bool
 	app := &App{
-		ConfigPath: path,
-		Input:      strings.NewReader("11\n13\n"),
-		Output:     &bytes.Buffer{},
+		ConfigPath:     path,
+		Input:          strings.NewReader("11\n13\n"),
+		Output:         &bytes.Buffer{},
+		UpdateLockPath: filepath.Join(t.TempDir(), "update.lock"),
 		updateAgent: func(_ context.Context, cfg config.Config, _ io.Writer) error {
 			called = true
 			if cfg.URL != initial.URL || cfg.Token != initial.Token {
@@ -108,8 +111,9 @@ func TestMenuUpdateRefusesWhileScannerIsRunning(t *testing.T) {
 
 	var called bool
 	app := &App{
-		ConfigPath: filepath.Join(dir, "config.json"),
-		Manager:    &manager,
+		ConfigPath:     filepath.Join(dir, "config.json"),
+		Manager:        &manager,
+		UpdateLockPath: filepath.Join(dir, "update.lock"),
 		updateAgent: func(context.Context, config.Config, io.Writer) error {
 			called = true
 			return nil
@@ -121,6 +125,77 @@ func TestMenuUpdateRefusesWhileScannerIsRunning(t *testing.T) {
 	}
 	if called {
 		t.Fatal("updater ran while scanner was active")
+	}
+}
+
+func TestMenuManualUpdateUsesSharedUpdateLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "update.lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- autoupdate.WithUpdateLock(path, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	called := false
+	app := &App{
+		ConfigPath:     filepath.Join(t.TempDir(), "config.json"),
+		UpdateLockPath: path,
+		updateAgent: func(context.Context, config.Config, io.Writer) error {
+			called = true
+			return nil
+		},
+	}
+	cfg := config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "id"}
+
+	err := app.updateLatest(&cfg)
+	if !errors.Is(err, autoupdate.ErrUpdateInProgress) {
+		t.Fatalf("updateLatest() error = %v, want ErrUpdateInProgress", err)
+	}
+	if called {
+		t.Fatal("manual updater ran while automatic update lock was held")
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first lock holder error = %v", err)
+	}
+}
+
+func TestMenuStartUsesSharedUpdateLockBeforeScannerStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "update.lock")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- autoupdate.WithUpdateLock(path, func() error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	manager := &Manager{
+		Executable: "/bin/sleep",
+		Arguments:  []string{"30"},
+		RunDir:     filepath.Join(t.TempDir(), "run"),
+		LogDir:     filepath.Join(t.TempDir(), "log"),
+	}
+	app := &App{ConfigPath: filepath.Join(t.TempDir(), "config.json"), Manager: manager, UpdateLockPath: path}
+	cfg := config.Config{URL: "https://worker.example", Token: "token", ASN: 16509, Limit: 100, CurlWorkers: 10, MasscanCPUPercent: 30, AgentID: "id"}
+
+	err := app.start(&cfg)
+	if !errors.Is(err, autoupdate.ErrUpdateInProgress) {
+		t.Fatalf("start() error = %v, want ErrUpdateInProgress", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first lock holder error = %v", err)
 	}
 }
 

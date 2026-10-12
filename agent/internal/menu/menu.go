@@ -12,17 +12,19 @@ import (
 	"strconv"
 	"strings"
 
+	"cf-san/internal/autoupdate"
 	"cf-san/internal/backend"
 	"cf-san/internal/config"
 	"cf-san/internal/scanner"
 )
 
 type App struct {
-	ConfigPath  string
-	Manager     *Manager
-	Input       io.Reader
-	Output      io.Writer
-	updateAgent func(context.Context, config.Config, io.Writer) error
+	ConfigPath     string
+	Manager        *Manager
+	Input          io.Reader
+	Output         io.Writer
+	UpdateLockPath string
+	updateAgent    func(context.Context, config.Config, io.Writer) error
 }
 
 func NewApp() *App {
@@ -46,6 +48,13 @@ func (app *App) manager() *Manager {
 	}
 	manager := NewManager()
 	return &manager
+}
+
+func (app *App) updateLockPath() string {
+	if app.UpdateLockPath != "" {
+		return app.UpdateLockPath
+	}
+	return autoupdate.DefaultUpdateLockPath
 }
 
 func (app *App) Run() error {
@@ -202,43 +211,48 @@ func (app *App) initialize(reader *bufio.Reader, cfg *config.Config) error {
 }
 
 func (app *App) start(cfg *config.Config) error {
-	if err := config.ValidateForScan(*cfg); err != nil {
-		return err
-	}
-	if _, err := exec.LookPath("masscan"); err != nil {
-		return errors.New("未找到 masscan；请先选择菜单 1 初始化环境")
-	}
-	if _, err := exec.LookPath("curl"); err != nil {
-		return errors.New("未找到 curl；请先选择菜单 1 初始化环境")
-	}
-	if _, err := exec.LookPath("cpulimit"); err != nil {
-		return errors.New("未找到 cpulimit；请先选择菜单 1 初始化环境")
-	}
-	if err := config.Save(app.ConfigPath, *cfg); err != nil {
-		return err
-	}
-	return app.manager().Start()
+	manager := app.manager()
+	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+		if err := config.ValidateForScan(*cfg); err != nil {
+			return err
+		}
+		if _, err := exec.LookPath("masscan"); err != nil {
+			return errors.New("未找到 masscan；请先选择菜单 1 初始化环境")
+		}
+		if _, err := exec.LookPath("curl"); err != nil {
+			return errors.New("未找到 curl；请先选择菜单 1 初始化环境")
+		}
+		if _, err := exec.LookPath("cpulimit"); err != nil {
+			return errors.New("未找到 cpulimit；请先选择菜单 1 初始化环境")
+		}
+		if err := config.Save(app.ConfigPath, *cfg); err != nil {
+			return err
+		}
+		return manager.Start()
+	})
 }
 
 func (app *App) updateLatest(cfg *config.Config) error {
-	running, err := app.manager().Status()
-	if err != nil {
-		return err
-	}
-	if running {
-		return errors.New("请先暂停扫描，再执行更新")
-	}
-	if err := config.Validate(*cfg); err != nil {
-		return err
-	}
-	if err := config.Save(app.ConfigPath, *cfg); err != nil {
-		return err
-	}
 	updater := app.updateAgent
 	if updater == nil {
 		updater = updateLatestFromWorker
 	}
-	return updater(context.Background(), *cfg, app.Output)
+	return autoupdate.WithUpdateLock(app.updateLockPath(), func() error {
+		running, err := app.manager().Status()
+		if err != nil {
+			return err
+		}
+		if running {
+			return errors.New("请先暂停扫描，再执行更新")
+		}
+		if err := config.Validate(*cfg); err != nil {
+			return err
+		}
+		if err := config.Save(app.ConfigPath, *cfg); err != nil {
+			return err
+		}
+		return updater(context.Background(), *cfg, app.Output)
+	})
 }
 
 func (app *App) updateSetting(reader *bufio.Reader, cfg *config.Config, choice string) error {

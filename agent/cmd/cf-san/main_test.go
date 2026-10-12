@@ -1,11 +1,32 @@
 package main
 
 import (
+	"errors"
+	"os"
 	"reflect"
 	"testing"
 
 	"cf-san/internal/config"
 )
+
+func TestRequireRoot(t *testing.T) {
+	if err := requireRoot(1000); err == nil {
+		t.Fatal("requireRoot(1000) error = nil, want non-root rejection")
+	}
+	if err := requireRoot(0); err != nil {
+		t.Fatalf("requireRoot(0) error = %v, want nil", err)
+	}
+}
+
+func TestVersionCommandDoesNotReadConfig(t *testing.T) {
+	missingPath := t.TempDir() + "/does-not-exist/config.json"
+	if err := run([]string{"version", "--config", missingPath}); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("version command read missing config: %v", err)
+		}
+		t.Fatalf("version command error = %v", err)
+	}
+}
 
 func TestParseOptionsAppliesCLIOverrides(t *testing.T) {
 	options, err := parseOptions([]string{"--url", "https://worker.example/", "--token", "new-token", "--asn", "906", "--limit", "250", "--workers", "40", "--cpu-percent", "45", "--config", "/tmp/cf-san.json"})

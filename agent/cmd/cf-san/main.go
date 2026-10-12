@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"cf-san/internal/autoupdate"
 	"cf-san/internal/backend"
 	"cf-san/internal/buildinfo"
 	"cf-san/internal/config"
@@ -40,6 +41,11 @@ func run(arguments []string) error {
 	if command == "version" {
 		fmt.Fprintln(os.Stdout, buildinfo.Display())
 		return nil
+	}
+	if command == "auto-update" {
+		if err := requireRoot(os.Geteuid()); err != nil {
+			return err
+		}
 	}
 	options, err := parseOptions(arguments)
 	if err != nil {
@@ -87,9 +93,45 @@ func run(arguments []string) error {
 			return err
 		}
 		return runScan(cfg, options.configPath)
+	case "auto-update":
+		if err := config.Validate(cfg); err != nil {
+			return err
+		}
+		manager := menu.NewManager()
+		manager.Arguments = []string{"run", "--config", options.configPath}
+		return runAutomaticUpdate(cfg, options.configPath, manager)
 	default:
-		return fmt.Errorf("未知命令 %q；可用命令：menu、configure、run、version", command)
+		return fmt.Errorf("未知命令 %q；可用命令：menu、configure、run、version、auto-update", command)
 	}
+}
+
+func requireRoot(uid int) error {
+	if uid != 0 {
+		return errors.New("automatic updates require root privileges")
+	}
+	return nil
+}
+
+func runAutomaticUpdate(cfg config.Config, configPath string, scanner autoupdate.Scanner) error {
+	if configPath == "" {
+		return errors.New("automatic update config path is missing")
+	}
+	logger, err := autoupdate.OpenLogger(autoupdate.DefaultUpdateLogPath)
+	if err != nil {
+		return err
+	}
+	runner := autoupdate.Runner{
+		CurrentVersion: buildinfo.Version,
+		Repository:     buildinfo.Repository,
+		Releases:       autoupdate.NewGitHubClient(),
+		Scanner:        scanner,
+		Install: func(ctx context.Context, installCfg config.Config, version string, output io.Writer) error {
+			return autoupdate.InstallFromWorker(ctx, installCfg, version, output)
+		},
+		Logger:   logger,
+		LockPath: autoupdate.DefaultUpdateLockPath,
+	}
+	return runner.Run(context.Background(), cfg)
 }
 
 func parseOptions(arguments []string) (cliOptions, error) {
