@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 INSTALLER="$SCRIPT_DIR/install.sh"
+MOCKED_INSTALLER_TEST="$SCRIPT_DIR/install_mocked_test.sh"
 
 fail() {
   printf 'installer test failed: %s\n' "$1" >&2
@@ -11,6 +12,8 @@ fail() {
 
 sh -n "$INSTALLER" || fail 'installer has invalid POSIX shell syntax'
 bash -n "$INSTALLER" || fail 'installer has invalid Bash-compatible syntax'
+sh -n "$MOCKED_INSTALLER_TEST" || fail 'mocked installer test has invalid POSIX shell syntax'
+bash -n "$MOCKED_INSTALLER_TEST" || fail 'mocked installer test has invalid Bash-compatible syntax'
 
 HELP_OUTPUT=$(sh "$INSTALLER" --help 2>&1) || fail '--help did not succeed'
 printf '%s' "$HELP_OUTPUT" | grep -q 'Usage:' || fail '--help omitted usage'
@@ -57,6 +60,12 @@ expect_failure 'version must be a stable vMAJOR.MINOR.PATCH tag' \
 # preflight test; the mocked integration test exercises the real downloads.
 grep -Fq 'releases/latest/download' "$INSTALLER" || fail 'installer lost latest-release URL'
 grep -Fq 'releases/download/${UPDATE_VERSION}' "$INSTALLER" || fail 'installer lost pinned-release URL'
+grep -Fq '17 3 * * * root /usr/local/libexec/cf-san-auto-update' "$INSTALLER" || fail 'installer lost Debian 03:17 cron schedule'
+grep -Fq '1801' "$INSTALLER" || fail 'installer lost the 0..1800 second jitter bound'
+grep -Fq 'systemctl enable --now cron' "$INSTALLER" || fail 'installer lost the Debian systemd activation path'
+grep -Fq 'update-rc.d cron defaults' "$INSTALLER" || fail 'installer lost the Debian non-systemd activation path'
+grep -Fq 'rc-update add crond default' "$INSTALLER" || fail 'installer lost the Alpine OpenRC activation path'
+grep -Fq 'detect_supported_os' "$INSTALLER" || fail 'installer does not validate the supported OS before update-only work'
 
 if printf '%s' "$OUTPUT" | grep -q 'token-must-not-leak'; then
   fail 'installer echoed the API token in an error message'

@@ -6,6 +6,8 @@ BACKEND_URL=${CF_SAN_BACKEND_URL:-}
 API_TOKEN=${CF_SAN_API_TOKEN:-}
 UPDATE_ONLY=0
 UPDATE_VERSION=
+DISTRO_ID=
+CRON_PACKAGE_READY=0
 
 fail() {
   printf 'cf-san installer: %s\n' "$1" >&2
@@ -74,6 +76,19 @@ printf '%s\n' "$RELEASE_REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+
 
 [ "$(id -u)" -eq 0 ] || fail 'run this script with sudo or as root'
 
+detect_supported_os() {
+  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID=${ID:-}
+  case "$DISTRO_ID" in
+    debian|alpine) ;;
+    *) fail "unsupported Linux distribution: ${DISTRO_ID:-unknown}; supported: Debian and Alpine" ;;
+  esac
+}
+
+detect_supported_os
+
 debian_pcap_package() {
   if apt-cache show libpcap0.8t64 2>/dev/null | grep -q '^Package: libpcap0.8t64$'; then
     printf '%s\n' libpcap0.8t64
@@ -101,11 +116,118 @@ ensure_alpine_pcap() {
   apk add --no-cache libpcap-dev
 }
 
+ensure_debian_cron_package() {
+  command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
+  if ! apt-get update; then
+    fail 'cannot refresh Debian package indexes while installing cron'
+  fi
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y cron; then
+    fail 'cannot install the Debian cron package'
+  fi
+  CRON_PACKAGE_READY=1
+}
+
+write_scheduler_files() {
+  command -v od >/dev/null 2>&1 || fail 'od is required to randomize the daily update delay'
+  command -v sleep >/dev/null 2>&1 || fail 'sleep is required to randomize the daily update delay'
+  command -v tr >/dev/null 2>&1 || fail 'tr is required to randomize the daily update delay'
+
+  if ! install -d -m 0700 /var/log/cf-san; then
+    fail 'cannot create the root-only cf-san update log directory'
+  fi
+  if [ ! -e /var/log/cf-san/update.log ]; then
+    if ! (umask 077 && : > /var/log/cf-san/update.log); then
+      fail 'cannot create the cf-san update log'
+    fi
+  fi
+  if ! chmod 0600 /var/log/cf-san/update.log; then
+    fail 'cannot protect the cf-san update log'
+  fi
+
+  if ! install -d -m 0755 /usr/local/libexec; then
+    fail 'cannot create the cf-san scheduler directory'
+  fi
+  WRAPPER_SOURCE="$TEMP_DIR/cf-san-auto-update"
+  cat > "$WRAPPER_SOURCE" <<'WRAPPER'
+#!/bin/sh
+set -eu
+
+raw=$(od -An -N4 -tu4 /dev/urandom | tr -d '[:space:]')
+case "$raw" in
+  ''|*[!0-9]*)
+    printf '%s\n' 'cf-san auto-update: cannot generate a random delay' >&2
+    exit 1
+    ;;
+esac
+delay=$((raw % 1801))
+sleep "$delay"
+exec /usr/local/bin/cf-san auto-update >> /var/log/cf-san/update.log 2>&1
+WRAPPER
+  if ! install -m 0750 "$WRAPPER_SOURCE" /usr/local/libexec/cf-san-auto-update; then
+    fail 'cannot install the cf-san scheduler wrapper'
+  fi
+
+  case "$DISTRO_ID" in
+    debian)
+      if ! install -d -m 0755 /etc/cron.d; then
+        fail 'cannot create the Debian cron directory'
+      fi
+      CRON_SOURCE="$TEMP_DIR/cf-san-cron"
+      printf '%s\n' '17 3 * * * root /usr/local/libexec/cf-san-auto-update' > "$CRON_SOURCE"
+      if ! install -m 0644 "$CRON_SOURCE" /etc/cron.d/cf-san-auto-update; then
+        fail 'cannot install the Debian cf-san cron job'
+      fi
+      ;;
+    alpine)
+      if ! install -d -m 0755 /etc/periodic/daily; then
+        fail 'cannot create the Alpine daily job directory'
+      fi
+      PERIODIC_SOURCE="$TEMP_DIR/cf-san-periodic"
+      printf '%s\n' '#!/bin/sh' 'exec /usr/local/libexec/cf-san-auto-update' > "$PERIODIC_SOURCE"
+      if ! install -m 0700 "$PERIODIC_SOURCE" /etc/periodic/daily/cf-san-auto-update; then
+        fail 'cannot install the Alpine cf-san daily job'
+      fi
+      ;;
+  esac
+}
+
+install_scheduler() {
+  case "$DISTRO_ID" in
+    debian)
+      if [ "$CRON_PACKAGE_READY" -ne 1 ]; then
+        ensure_debian_cron_package
+      fi
+      if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl enable --now cron; then
+          fail 'cannot enable the Debian cron service: systemctl enable --now cron failed'
+        fi
+      elif command -v update-rc.d >/dev/null 2>&1 && command -v service >/dev/null 2>&1; then
+        if ! update-rc.d cron defaults; then
+          fail 'cannot enable the Debian cron service: update-rc.d cron defaults failed'
+        fi
+        if ! service cron start; then
+          fail 'cannot enable the Debian cron service: service cron start failed'
+        fi
+      else
+        fail 'cannot enable the Debian cron service: systemctl or update-rc.d plus service is required'
+      fi
+      ;;
+    alpine)
+      command -v rc-update >/dev/null 2>&1 || fail 'cannot enable the Alpine crond service: rc-update is required'
+      command -v rc-service >/dev/null 2>&1 || fail 'cannot enable the Alpine crond service: rc-service is required'
+      if ! rc-update add crond default; then
+        fail 'cannot enable the Alpine crond service: rc-update add crond default failed'
+      fi
+      if ! rc-service crond start; then
+        fail 'cannot enable the Alpine crond service: rc-service crond start failed'
+      fi
+      ;;
+  esac
+  write_scheduler_files
+}
+
 install_masscan() {
-  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
+  case "$DISTRO_ID" in
     debian)
       command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
@@ -118,7 +240,7 @@ install_masscan() {
       apk add --no-cache masscan cpulimit libpcap-dev
       ;;
     *)
-      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      fail "unsupported Linux distribution: ${DISTRO_ID:-unknown}; supported: Debian and Alpine"
       ;;
   esac
   command -v masscan >/dev/null 2>&1 || fail 'Masscan installation failed; install the masscan package and retry'
@@ -128,10 +250,7 @@ ensure_cpulimit() {
   if command -v cpulimit >/dev/null 2>&1; then
     return 0
   fi
-  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
+  case "$DISTRO_ID" in
     debian)
       command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
       apt-get update
@@ -142,30 +261,28 @@ ensure_cpulimit() {
       apk add --no-cache cpulimit
       ;;
     *)
-      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      fail "unsupported Linux distribution: ${DISTRO_ID:-unknown}; supported: Debian and Alpine"
       ;;
   esac
   command -v cpulimit >/dev/null 2>&1 || fail 'cpulimit installation failed'
 }
 
 if [ "$UPDATE_ONLY" -eq 0 ]; then
-  [ -r /etc/os-release ] || fail 'cannot identify Linux distribution'
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
+  case "$DISTRO_ID" in
     debian)
       command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
       apt-get update
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
       PCAP_PACKAGE=$(debian_pcap_package)
-      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip masscan cpulimit "$PCAP_PACKAGE"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl coreutils tar gzip masscan cpulimit cron "$PCAP_PACKAGE"
+      CRON_PACKAGE_READY=1
       ;;
     alpine)
       command -v apk >/dev/null 2>&1 || fail 'apk is required on Alpine'
       apk add --no-cache ca-certificates curl coreutils tar gzip masscan cpulimit libpcap-dev
       ;;
     *)
-      fail "unsupported Linux distribution: ${ID:-unknown}; supported: Debian and Alpine"
+      fail "unsupported Linux distribution: ${DISTRO_ID:-unknown}; supported: Debian and Alpine"
       ;;
   esac
 else
@@ -177,14 +294,12 @@ else
   else
     # Masscan 1.3.2 on Debian Bookworm does not declare its dynamically
     # loaded libpcap runtime as a package dependency. Repair older installs too.
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    if [ "${ID:-}" = debian ]; then
+    if [ "$DISTRO_ID" = debian ]; then
       command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required on Debian'
       command -v apt-cache >/dev/null 2>&1 || fail 'apt-cache is required on Debian'
       command -v dpkg-query >/dev/null 2>&1 || fail 'dpkg-query is required on Debian'
       ensure_debian_pcap
-    elif [ "${ID:-}" = alpine ]; then
+    elif [ "$DISTRO_ID" = alpine ]; then
       ensure_alpine_pcap
     fi
   fi
@@ -203,6 +318,7 @@ esac
 TEMP_DIR=$(mktemp -d)
 cleanup() { rm -rf -- "$TEMP_DIR"; }
 trap cleanup 0
+install_scheduler
 ARCHIVE="cf-san_linux_${ARCH}.tar.gz"
 if [ -n "$UPDATE_VERSION" ]; then
   BASE_URL="https://github.com/${RELEASE_REPOSITORY}/releases/download/${UPDATE_VERSION}"
