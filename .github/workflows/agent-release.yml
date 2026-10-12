@@ -90,7 +90,7 @@ jobs:
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           mkdir -p "$work/out"
-          go build -trimpath -ldflags='-s -w' -o "$work/out/cf-san" ./cmd/cf-san
+          go build -trimpath -ldflags="-s -w -X cf-san/internal/buildinfo.Version=${GITHUB_REF_NAME} -X cf-san/internal/buildinfo.Repository=${GITHUB_REPOSITORY}" -o "$work/out/cf-san" ./cmd/cf-san
           # Cross-compiled binaries cannot run on the amd64 GitHub runner.
           # Inspect the ELF architecture for every build, and only execute the
           # native binary as a smoke test.
@@ -106,6 +106,12 @@ jobs:
             *) HOST_GOARCH=unknown ;;
           esac
           if [ "$GOARCH" = "$HOST_GOARCH" ]; then
+            version_output=$("$work/out/cf-san" version)
+            expected_version="cf-san ${GITHUB_REF_NAME} (${GITHUB_REPOSITORY})"
+            if [ "$version_output" != "$expected_version" ]; then
+              echo "unexpected version output: $version_output" >&2
+              exit 1
+            fi
             "$work/out/cf-san" configure \
               --config "$work/config.json" \
               --url https://worker.example \

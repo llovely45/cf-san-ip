@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"cf-san/internal/backend"
+	"cf-san/internal/buildinfo"
 	"cf-san/internal/config"
 	"cf-san/internal/menu"
 	"cf-san/internal/scanner"
@@ -35,6 +36,10 @@ func run(arguments []string) error {
 	if len(arguments) > 0 && !strings.HasPrefix(arguments[0], "-") {
 		command = arguments[0]
 		arguments = arguments[1:]
+	}
+	if command == "version" {
+		fmt.Fprintln(os.Stdout, buildinfo.Display())
+		return nil
 	}
 	options, err := parseOptions(arguments)
 	if err != nil {
@@ -83,7 +88,7 @@ func run(arguments []string) error {
 		}
 		return runScan(cfg, options.configPath)
 	default:
-		return fmt.Errorf("未知命令 %q；可用命令：menu、configure、run", command)
+		return fmt.Errorf("未知命令 %q；可用命令：menu、configure、run、version", command)
 	}
 }
 
